@@ -21,6 +21,7 @@ import {
   RotateCcw,
   Settings,
   PackagePlus,
+  PackageCheck,
   Banknote,
   Smartphone,
   Landmark,
@@ -37,6 +38,7 @@ import {
   Warehouse,
   ListPlus,
   StickyNote,
+  Clock,
 } from 'lucide-react';
 import {
   collection,
@@ -57,38 +59,48 @@ import {
 import { db } from '../Libs/firebase_config.mjs';
 
 /* ======================================================================
-   OPERATIONS — v2
+   OPERATIONS — v3
 
    One workspace for the whole production-to-sale chain. Every store is
    given a ROLE in the setup screen (gear icon):
 
      Factory    → Materials · Suppliers · Make shoes · Orders · Machines · Pay
                   (numbered in the order you should set things up)
-     Warehouse  → Stock · Orders
-     Retail     → Stock · Orders
+     Warehouse  → Stock · Orders (all orders, from every place)
+     Retail     → Stock · Orders (all orders, from every place)
 
    Rules that run through every screen:
-     1. Type once, pick forever — every free-text field (materials,
-        suppliers, products, clients, steps, loss reasons, machine roles,
-        attribute names/values, production-cost names) offers what was
+     1. Type once, pick forever — every free-text field offers what was
         typed before as tap-to-fill chips.
      2. Every area works the same way: a list, one obvious button on
         top, tap a row to open a sheet with its actions.
      3. Every action ends with a success check and a plain next-step
         question.
 
-   What's new in v2
-     - Place roles (opsSettings.roles = { [storeId]: 'factory' | 'warehouse' | 'retail' }).
-     - Stock view for warehouse / retail places. Reads the shared
-       items / storeItems / stock collections that finished production
-       runs already write to. Free-text attributes (colour…), a low-stock
-       alert level, move-to-another-place, and stock counts.
-     - Orders can take pairs from stock (deducted in a transaction when
-       the order is saved) or send them to production. One order can mix
-       both. "Cancel order" puts stock back.
-     - Production costs are free-text "name + amount" rows, remembered in
-       opsLists.costDefaults so next time it is one tap.
-     - Suppliers can be added directly, before any restock.
+   What's new in v3
+     - RESTOCK: the payment method (cash / M-Pesa / bank) is recorded.
+       Each purchase keeps its own `payments` list and `deliveries` list,
+       plus `paidOffDate` and `fullyDeliveredDate`.
+     - SUPPLIERS: a full statement per supplier — every purchase with what
+       was owed, every payment (method + date), when it was paid off, and
+       every delivery (date + reason for any delay). Later payments to a
+       supplier are applied to the OLDEST unpaid purchases first, so each
+       purchase shows exactly how it was cleared.
+     - LATE DELIVERY: when the rest of a restock arrives you enter the date
+       it arrived and the reason it was late.
+     - PRODUCTION DATES: a run has a start date and a production date. The
+       production date is stamped on the stock it creates (activity log and
+       stock.lastProductionDate) and on the material usage records.
+     - DELIVERY DEDUCTS STOCK: orders no longer take pairs out of stock when
+       saved. Pairs leave the warehouse only when the order is marked
+       DELIVERED (with a delivery date), and that reduction is recorded.
+       Pairs promised to open orders show as "reserved" so they are not sold
+       twice. Orders made through production remember where their finished
+       pairs were placed, so delivering them deducts from that place.
+     - PAYROLL (per pair): several people can work on one step of a run. When
+       paying a per-pair worker you pick the services (steps) they did from
+       real production runs — pairs and rate are filled in — or add your own
+       number. Anything already paid is marked so it cannot be paid twice.
 
    Data (all scoped by storeId, admin-only — see firestore.rules):
      opsMaterials / opsMovements / opsRestocks / opsSuppliers /
@@ -99,6 +111,10 @@ import { db } from '../Libs/firebase_config.mjs';
 
    No composite indexes are needed: every query is equality-only and
    sorted in the browser.
+
+   Old data: orders saved before v3 already took their stock when saved.
+   Their lines carry no `deducted` flag, so delivering them never deducts
+   twice. Old step records with a single `doneById` still show as one worker.
    ====================================================================== */
 
 /* ------------------------------------------------------------------ */
@@ -117,6 +133,7 @@ const PAY_METHODS = [
   { id: 'mpesa', label: 'M-Pesa', icon: Smartphone },
   { id: 'bank', label: 'Bank', icon: Landmark },
 ];
+const methodLabel = (id) => PAY_METHODS.find((m) => m.id === id)?.label || (id ? id : 'Method not recorded');
 const ROLES = [
   { id: 'factory', label: 'Factory', icon: Factory },
   { id: 'warehouse', label: 'Warehouse', icon: Warehouse },
@@ -139,6 +156,13 @@ const formatDate = (value) => {
   const d = typeof value === 'string' ? new Date(value) : value?.toDate?.() || value;
   if (!(d instanceof Date) || isNaN(d)) return '—';
   return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+};
+
+const daysSince = (dateStr) => {
+  if (!dateStr) return 0;
+  const d = new Date(dateStr);
+  if (isNaN(d)) return 0;
+  return Math.max(0, Math.floor((Date.now() - d.getTime()) / 864e5));
 };
 
 const blendAvg = (oldQty, oldAvg, addQty, addCost) => {
@@ -237,6 +261,16 @@ const WORK_BADGE = {
 const WORK_FLOW = ['waiting', 'making', 'ready', 'delivered'];
 const lineNeedsMaking = (l) => l.source !== 'stock' && !l.made;
 
+// People who worked on a step of a run. Old records had one `doneById`.
+const stepWorkers = (s) => (s?.workers?.length ? s.workers : s?.doneById ? [{ staffId: s.doneById, name: s.doneBy || '', pairs: '' }] : []);
+// Pairs credited to one worker on one step: what was typed, else the run's
+// good pairs shared equally between the people on that step.
+const creditedPairs = (step, worker, run) => {
+  if (worker.pairs !== '' && worker.pairs !== undefined && worker.pairs !== null) return num(worker.pairs);
+  const n = stepWorkers(step).length || 1;
+  return num(run.madeTotal) / n;
+};
+
 const ACTIVITY_TITLES = {
   created: 'Added',
   restocked: 'Stock added',
@@ -245,6 +279,7 @@ const ACTIVITY_TITLES = {
   edited: 'Details edited',
   counted: 'Stock count',
   sold: 'Taken for an order',
+  delivered: 'Delivered to a client',
   returned: 'Put back (order cancelled)',
 };
 
@@ -274,7 +309,7 @@ const useStoreDocs = (name, storeId, extra) => {
   return state;
 };
 
-// Orders from every place — the factory needs to see them all.
+// Orders from every place — every place needs to see them all.
 const useAllDocs = (name) => {
   const [state, setState] = useState({ rows: [], loading: true });
   useEffect(
@@ -371,6 +406,19 @@ const stockState = (row) => {
   const threshold = num(row.storeItem.lowStockThreshold);
   const out = qty <= 0;
   return { qty, out, low: !out && threshold > 0 && qty <= threshold, threshold };
+};
+
+// Pairs promised to open orders but not yet delivered (so not yet deducted).
+const reservedPairs = (orders, placeId, itemId) => {
+  const bySize = {};
+  (orders || [])
+    .filter((o) => !['delivered', 'cancelled'].includes(o.workStatus))
+    .forEach((o) =>
+      (o.lines || [])
+        .filter((l) => l.deducted === false && l.stockPlaceId === placeId && l.itemId === itemId)
+        .forEach((l) => Object.entries(l.sizes || {}).forEach(([size, q]) => (bySize[size] = (bySize[size] || 0) + num(q))))
+    );
+  return bySize;
 };
 
 /* ------------------------------------------------------------------ */
@@ -673,7 +721,7 @@ const TabBar = ({ tabs, value, onChange }) => (
   </div>
 );
 
-const ConfirmDialog = ({ icon: Icon = AlertTriangle, tone = 'danger', title, body, confirmLabel = 'Confirm', saving, onCancel, onConfirm, children }) => (
+const ConfirmDialog = ({ icon: Icon = AlertTriangle, tone = 'danger', title, body, confirmLabel = 'Confirm', saving, disabled, onCancel, onConfirm, children }) => (
   <ModalShell onClose={onCancel}>
     <div className="text-center">
       <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl" style={{ background: tone === 'danger' ? '#FBEAE8' : '#EAF2FE', color: tone === 'danger' ? '#C0433A' : '#2B6CDA' }}>
@@ -684,12 +732,12 @@ const ConfirmDialog = ({ icon: Icon = AlertTriangle, tone = 'danger', title, bod
       </h3>
       <p className="mt-1.5 text-sm leading-relaxed text-[#5C7196]">{body}</p>
     </div>
-    {children && <div className="mt-4">{children}</div>}
+    {children && <div className="mt-4 space-y-3 text-left">{children}</div>}
     <div className="mt-6 flex gap-2.5">
       <button type="button" onClick={onCancel} className="flex-1 rounded-full border border-[#E1E8F4] py-2.5 text-[15px] font-medium text-[#4C5E7A]">
         Cancel
       </button>
-      <button type="button" onClick={onConfirm} disabled={saving} className="flex-1 rounded-full py-2.5 text-[15px] font-semibold text-white disabled:opacity-60" style={{ background: tone === 'danger' ? '#C0433A' : '#2B6CDA' }}>
+      <button type="button" onClick={onConfirm} disabled={saving || disabled} className="flex-1 rounded-full py-2.5 text-[15px] font-semibold text-white disabled:opacity-40" style={{ background: tone === 'danger' ? '#C0433A' : '#2B6CDA' }}>
         {saving ? 'Working…' : confirmLabel}
       </button>
     </div>
@@ -911,6 +959,7 @@ const RestockModal = ({ material, ctx, onClose, onAgain }) => {
   const [supplier, setSupplier] = useState(material.supplier || '');
   const [payMode, setPayMode] = useState('full');
   const [paidAmt, setPaidAmt] = useState('');
+  const [payMethod, setPayMethod] = useState('cash');
   const [delMode, setDelMode] = useState('full');
   const [recvQty, setRecvQty] = useState('');
   const [saving, setSaving] = useState(false);
@@ -936,6 +985,7 @@ const RestockModal = ({ material, ctx, onClose, onAgain }) => {
       const supId = keyOf(storeId, sup);
       const known = suppliers.some((s) => s.id === supId);
       const unitCost = num(cost);
+      const stamp = Date.now();
       const b = writeBatch(db);
       const rRef = doc(collection(db, 'opsRestocks'));
       b.set(rRef, {
@@ -951,7 +1001,14 @@ const RestockModal = ({ material, ctx, onClose, onAgain }) => {
         unitCost,
         total,
         paid,
+        // Every payment on this purchase, with its method — later payments to the supplier are added here too.
+        payMethod: paid > 0 ? payMethod : '',
+        payments: paid > 0 ? [{ amount: paid, method: payMethod, date, at: stamp }] : [],
+        paidOffDate: owed <= 0 ? date : null,
         paymentStatus: owed <= 0 ? 'paid' : paid > 0 ? 'part' : 'credit',
+        // Every delivery on this purchase — a late delivery adds its date and the reason it was late.
+        deliveries: received > 0 ? [{ qty: received, date, reason: '', at: stamp }] : [],
+        fullyDeliveredDate: received >= q ? date : null,
         deliveryStatus: received >= q ? 'full' : 'part',
         status: 'active',
         createdAt: serverTimestamp(),
@@ -967,6 +1024,20 @@ const RestockModal = ({ material, ctx, onClose, onAgain }) => {
         { storeId, name: sup, owed: increment(owed), updatedAt: serverTimestamp(), ...(known ? {} : { createdAt: serverTimestamp() }) },
         { merge: true }
       );
+      if (paid > 0) {
+        b.set(doc(collection(db, 'opsSupplierPayments')), {
+          storeId,
+          supplierId: supId,
+          supplierName: sup,
+          amount: paid,
+          method: payMethod,
+          date,
+          kind: 'purchase',
+          restockId: rRef.id,
+          allocations: [{ restockId: rRef.id, label: `${material.name} · ${formatDate(date)}`, amount: paid }],
+          createdAt: serverTimestamp(),
+        });
+      }
       if (received > 0) {
         b.set(doc(collection(db, 'opsMovements')), {
           storeId,
@@ -976,7 +1047,7 @@ const RestockModal = ({ material, ctx, onClose, onAgain }) => {
           type: 'restock',
           quantity: received,
           date,
-          detail: `${sup} · ${money(unitCost)}/${material.unit}${owed > 0 ? ` · owing ${money(owed)}` : ''}`,
+          detail: `${sup} · ${money(unitCost)}/${material.unit}${owed > 0 ? ` · owing ${money(owed)}` : ''}${paid > 0 ? ` · paid ${money(paid)} by ${methodLabel(payMethod)}` : ''}`,
           supplier: sup,
           unitCost,
           restockId: rRef.id,
@@ -987,11 +1058,12 @@ const RestockModal = ({ material, ctx, onClose, onAgain }) => {
       await b.commit();
       onClose();
       const notes = [];
+      if (paid > 0) notes.push(`${money(paid)} paid by ${methodLabel(payMethod)}.`);
       if (owed > 0) notes.push(`You now owe ${sup} ${money(owed)}.`);
       if (received < q) notes.push(`${qtyFmt(q - received)} ${material.unit} still to arrive — mark it received on the material when it comes.`);
       setFollowUp({
         title: 'Restock recorded',
-        message: `${qtyFmt(received)} ${material.unit} of ${material.name} added to stock.${notes.length ? ' ' + notes.join(' ') : ''}`,
+        message: `${qtyFmt(received)} ${material.unit} of ${material.name} added to stock.${notes.length ? ' ' + notes.join(' ') : ''} It's on ${sup}'s statement under Suppliers.`,
         question: 'Anything else to restock?',
         actions: [{ label: 'Restock another material', primary: true, onClick: onAgain }],
       });
@@ -1023,6 +1095,12 @@ const RestockModal = ({ material, ctx, onClose, onAgain }) => {
               <Field id="rs-paid" label="Amount paid so far" type="number" min="0" step="any" inputMode="decimal" value={paidAmt} onChange={(e) => setPaidAmt(e.target.value)} suffix="KSh" />
             </div>
           )}
+          {payMode !== 'credit' && (
+            <div className="mt-3">
+              <p className="mb-1.5 text-sm font-medium text-[#4C5E7A]">How did you pay?</p>
+              <ChoiceRow value={payMethod} onChange={setPayMethod} options={PAY_METHODS.map((m) => ({ id: m.id, label: m.label, icon: m.icon }))} />
+            </div>
+          )}
           {payMode !== 'full' && total > 0 && <p className="mt-2 text-sm font-medium text-[#B9812E]">You will owe {supplier.trim() || 'the supplier'} {money(owed)}.</p>}
         </div>
 
@@ -1032,7 +1110,7 @@ const RestockModal = ({ material, ctx, onClose, onAgain }) => {
           {delMode === 'part' && (
             <div className="mt-2.5">
               <Field id="rs-recv" label={`Received so far (${material.unit})`} type="number" min="0" step="any" inputMode="decimal" value={recvQty} onChange={(e) => setRecvQty(e.target.value)} />
-              <p className="mt-1 text-xs text-[#8CA0BC]">Stock only counts what has actually arrived.</p>
+              <p className="mt-1 text-xs text-[#8CA0BC]">Stock only counts what has actually arrived. When the rest comes you'll enter the date and why it was late.</p>
             </div>
           )}
         </div>
@@ -1197,13 +1275,15 @@ const LossReportModal = ({ ctx, onClose }) => {
 };
 
 const MaterialSheet = ({ material, ctx, onClose, onRestock, onCount, onEdit }) => {
-  const { storeId, notify, setFollowUp, suppliers } = ctx;
+  const { storeId, notify, setFollowUp, suppliers, lists } = ctx;
   const [hist, setHist] = useState({ moves: [], restocks: [], loading: true });
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
   const [busy, setBusy] = useState(false);
   const [confirm, setConfirm] = useState(null); // { type: 'rollback' | 'receive', restock }
   const [recvQty, setRecvQty] = useState('');
+  const [recvDate, setRecvDate] = useState(todayStr());
+  const [recvReason, setRecvReason] = useState('');
 
   const load = useCallback(async () => {
     try {
@@ -1232,14 +1312,35 @@ const MaterialSheet = ({ material, ctx, onClose, onRestock, onCount, onEdit }) =
   const isOut = num(material.quantity) <= 0;
   const isLow = !isOut && threshold > 0 && num(material.quantity) <= threshold;
 
+  // A delivery that comes after the purchase date needs a reason for the delay.
+  const recvTarget = confirm?.type === 'receive' ? confirm.restock : null;
+  const recvLate = !!recvTarget && recvDate > (recvTarget.date || '');
+  const recvInvalid = !!recvTarget && (num(recvQty) <= 0 || !recvDate || recvDate < (recvTarget.date || '') || (recvLate && !recvReason.trim()));
+
+  const openReceive = (r) => {
+    setRecvQty(String(num(r.quantity) - num(r.received)));
+    setRecvDate(todayStr());
+    setRecvReason('');
+    setConfirm({ type: 'receive', restock: r });
+  };
+
   const doReceive = async () => {
     const r = confirm.restock;
     const q = Math.min(num(recvQty), num(r.quantity) - num(r.received));
-    if (q <= 0) return;
+    if (q <= 0 || recvInvalid) return;
+    const reason = recvReason.trim();
     setBusy(true);
     try {
+      const nowReceived = num(r.received) + q;
+      const full = nowReceived >= num(r.quantity);
       const b = writeBatch(db);
-      b.update(doc(db, 'opsRestocks', r.id), { received: increment(q), deliveryStatus: num(r.received) + q >= num(r.quantity) ? 'full' : 'part' });
+      b.update(doc(db, 'opsRestocks', r.id), {
+        received: increment(q),
+        deliveryStatus: full ? 'full' : 'part',
+        deliveries: arrayUnion({ qty: q, date: recvDate, reason, at: Date.now() }),
+        lastDeliveryDate: recvDate,
+        ...(full ? { fullyDeliveredDate: recvDate } : {}),
+      });
       b.update(doc(db, 'opsMaterials', material.id), { quantity: increment(q), avgCost: blendAvg(material.quantity, material.avgCost, q, r.unitCost), updatedAt: serverTimestamp() });
       b.set(doc(collection(db, 'opsMovements')), {
         storeId,
@@ -1248,16 +1349,22 @@ const MaterialSheet = ({ material, ctx, onClose, onRestock, onCount, onEdit }) =
         unit: material.unit,
         type: 'restock',
         quantity: q,
-        date: todayStr(),
-        detail: `Delivery received · ${r.supplier}`,
+        date: recvDate,
+        detail: `Delivery received · ${r.supplier}${full ? '' : ' · more still to come'}`,
+        delayReason: reason,
         supplier: r.supplier,
         restockId: r.id,
         original: false,
         createdAt: serverTimestamp(),
       });
+      if (reason) b.set(doc(db, 'opsLists', storeId), { delayReasons: arrayUnion(reason), updatedAt: serverTimestamp() }, { merge: true });
       await b.commit();
       setConfirm(null);
-      setFollowUp({ title: 'Delivery received', message: `${qtyFmt(q)} ${material.unit} added to ${material.name}.`, actions: [] });
+      setFollowUp({
+        title: 'Delivery received',
+        message: `${qtyFmt(q)} ${material.unit} added to ${material.name} on ${formatDate(recvDate)}${reason ? ` (late: ${reason})` : ''}.${full ? ' The whole order has now arrived.' : ` ${qtyFmt(num(r.quantity) - nowReceived)} ${material.unit} still to come.`}`,
+        actions: [],
+      });
     } catch (err) {
       notify({ type: 'error', message: err?.message || 'Could not record delivery.' });
     } finally {
@@ -1338,9 +1445,9 @@ const MaterialSheet = ({ material, ctx, onClose, onRestock, onCount, onEdit }) =
             <div key={r.id} className="flex items-center justify-between gap-3 rounded-2xl border border-[#F0DCAF] bg-[#FBF0DA]/60 px-4 py-3">
               <div className="min-w-0 text-sm">
                 <p className="truncate font-semibold" style={{ color: INK }}>{qtyFmt(num(r.quantity) - num(r.received))} {material.unit} from {r.supplier}</p>
-                <p className="text-xs text-[#8A611E]">Ordered {formatDate(r.date)}</p>
+                <p className="flex items-center gap-1 text-xs text-[#8A611E]"><Clock size={11} /> Ordered {formatDate(r.date)} · waiting {daysSince(r.date)} day{daysSince(r.date) !== 1 ? 's' : ''}</p>
               </div>
-              <button type="button" onClick={() => { setRecvQty(String(num(r.quantity) - num(r.received))); setConfirm({ type: 'receive', restock: r }); }} className="shrink-0 rounded-full bg-[#2B6CDA] px-3.5 py-2 text-xs font-semibold text-white">
+              <button type="button" onClick={() => openReceive(r)} className="shrink-0 rounded-full bg-[#2B6CDA] px-3.5 py-2 text-xs font-semibold text-white">
                 Mark received
               </button>
             </div>
@@ -1375,6 +1482,7 @@ const MaterialSheet = ({ material, ctx, onClose, onRestock, onCount, onEdit }) =
                     <span className="text-[11px] text-[#8CA0BC]">{formatDate(m.date)}</span>
                   </div>
                   <p className="mt-0.5 text-sm text-[#5C7196]">{m.detail}</p>
+                  {m.delayReason && <p className="text-xs font-medium text-[#B9812E]">Arrived late: {m.delayReason}</p>}
                   <div className="mt-1 flex flex-wrap items-center justify-between gap-2">
                     <span className={`text-sm font-semibold ${delta < 0 ? 'text-[#C0433A]' : 'text-[#2B6CDA]'}`}>
                       {delta > 0 ? '+' : ''}{qtyFmt(delta)} {material.unit}
@@ -1412,13 +1520,19 @@ const MaterialSheet = ({ material, ctx, onClose, onRestock, onCount, onEdit }) =
             icon={Truck}
             tone="default"
             title="Mark delivery received"
-            body={`How much of ${material.name} arrived?`}
+            body={`${qtyFmt(num(confirm.restock.quantity) - num(confirm.restock.received))} ${material.unit} of ${material.name} is still to come from ${confirm.restock.supplier}. Ordered ${formatDate(confirm.restock.date)}.`}
             confirmLabel="Add to stock"
             saving={busy}
+            disabled={recvInvalid}
             onCancel={() => setConfirm(null)}
             onConfirm={doReceive}
           >
-            <Field id="recv" type="number" min="0" step="any" inputMode="decimal" value={recvQty} onChange={(e) => setRecvQty(e.target.value)} suffix={material.unit} />
+            <Field id="recv" label="How much arrived?" type="number" min="0" step="any" inputMode="decimal" value={recvQty} onChange={(e) => setRecvQty(e.target.value)} suffix={material.unit} />
+            <Field id="recv-date" label="Date it arrived" type="date" icon={CalendarDays} value={recvDate} onChange={(e) => setRecvDate(e.target.value)} />
+            {recvDate && recvDate < (confirm.restock.date || '') && <p className="text-xs font-medium text-[#C0433A]">That is before the purchase date.</p>}
+            {recvLate && (
+              <SuggestInput id="recv-why" label="Why was it late?" value={recvReason} onChange={setRecvReason} options={lists.delayReasons || []} placeholder="Supplier out of stock, transport, rain…" />
+            )}
           </ConfirmDialog>
         )}
       </AnimatePresence>
@@ -1560,10 +1674,13 @@ const MaterialsView = ({ ctx }) => {
 // Writes finished pairs into the shared items / storeItems / stock docs
 // at `destId`, with cost per pair as avgCost. The product's free-text
 // attributes and alert level carry over to the stock item. Resolves (or
-// creates) the shared catalog item by name. Returns itemId.
-const placeFinished = async (b, { destId, product, sizesMade, costPerPair, label }) => {
+// creates) the shared catalog item by name. The PRODUCTION DATE is stamped
+// on the stock rows (lastProductionDate) and on the activity log entry.
+// Returns itemId.
+const placeFinished = async (b, { destId, product, sizesMade, costPerPair, label, productionDate }) => {
   const sizes = Object.keys(sizesMade).filter((s) => num(sizesMade[s]) > 0).sort(sizeSort);
   const attrs = product.attributes || [];
+  const madeOn = productionDate || todayStr();
   let itemId = product.itemId || null;
   let itemDoc = null;
   if (itemId) {
@@ -1605,7 +1722,7 @@ const placeFinished = async (b, { destId, product, sizesMade, costPerPair, label
   sizes.forEach((s) => {
     const n = num(sizesMade[s]);
     const ex = existing[s];
-    const payload = { storeId: destId, itemId, variant: s, quantity: increment(n), avgCost: blendAvg(ex?.quantity, ex?.avgCost, n, costPerPair), updatedAt: serverTimestamp() };
+    const payload = { storeId: destId, itemId, variant: s, quantity: increment(n), avgCost: blendAvg(ex?.quantity, ex?.avgCost, n, costPerPair), lastProductionDate: madeOn, updatedAt: serverTimestamp() };
     if (!ex) payload.createdAt = serverTimestamp();
     b.set(doc(db, 'stock', stockKey(destId, itemId, s)), payload, { merge: true });
   });
@@ -1614,8 +1731,9 @@ const placeFinished = async (b, { destId, product, sizesMade, costPerPair, label
     storeId: destId,
     itemId,
     type: 'restocked',
-    date: todayStr(),
-    detail: `Produced in-house · ${label} · ${money(costPerPair)}/pair`,
+    date: madeOn,
+    productionDate: madeOn,
+    detail: `Produced in-house on ${formatDate(madeOn)} · ${label} · ${money(costPerPair)}/pair`,
     lineSummary: sizes.map((s) => `${s}: +${num(sizesMade[s])}`).join(', '),
     createdAt: serverTimestamp(),
   });
@@ -1805,6 +1923,7 @@ const StartRunModal = ({ preset, ctx, onClose, onNeedProduct, onStarted }) => {
   const [pick, setPick] = useState(presetPick || null);
   const [productId, setProductId] = useState(presetProduct?.id || (presetPick ? products.find((p) => lower(p.name) === lower(presetPick.line.productName))?.id : '') || '');
   const [sizes, setSizes] = useState({});
+  const [startDate, setStartDate] = useState(todayStr());
   const [saving, setSaving] = useState(false);
 
   const product = products.find((p) => p.id === productId);
@@ -1823,7 +1942,7 @@ const StartRunModal = ({ preset, ctx, onClose, onNeedProduct, onStarted }) => {
     }
   };
 
-  const canSave = product && totalPairs > 0 && (purpose === 'warehouse' || pick);
+  const canSave = product && totalPairs > 0 && startDate && (purpose === 'warehouse' || pick);
 
   const submit = async (e) => {
     e.preventDefault();
@@ -1847,9 +1966,9 @@ const StartRunModal = ({ preset, ctx, onClose, onNeedProduct, onStarted }) => {
         sizes: sizeMap,
         totalPairs,
         expected: needs.map((n) => ({ materialId: n.materialId, name: n.name, unit: n.unit, qty: Number(n.need.toFixed(3)) })),
-        steps: (product.steps || []).map((s) => ({ name: s, done: false, doneBy: '', doneById: '' })),
+        steps: (product.steps || []).map((s) => ({ name: s, done: false, workers: [], doneBy: '', doneById: '' })),
         status: 'in_progress',
-        startDate: todayStr(),
+        startDate,
         createdAt: serverTimestamp(),
       });
       if (purpose === 'order' && pick.order.workStatus === 'waiting') b.update(doc(db, 'opsOrders', pick.order.id), { workStatus: 'making', updatedAt: serverTimestamp() });
@@ -1857,8 +1976,8 @@ const StartRunModal = ({ preset, ctx, onClose, onNeedProduct, onStarted }) => {
       onClose();
       setFollowUp({
         title: `${runNo} started`,
-        message: `${totalPairs} pairs of ${product.name}${purpose === 'order' ? ` for ${pick.order.clientName}` : ' for the warehouse'}.${short.length ? ` Heads up: you're short on ${short.map((s) => s.name).join(', ')}.` : ''}`,
-        question: 'Open the run to tick off steps?',
+        message: `${totalPairs} pairs of ${product.name}${purpose === 'order' ? ` for ${pick.order.clientName}` : ' for the warehouse'}, started ${formatDate(startDate)}.${short.length ? ` Heads up: you're short on ${short.map((s) => s.name).join(', ')}.` : ''}`,
+        question: 'Open the run to tick off steps and add who is working on them?',
         actions: [{ label: 'Open run', primary: true, onClick: () => onStarted(ref.id) }],
       });
     } catch (err) {
@@ -1934,6 +2053,8 @@ const StartRunModal = ({ preset, ctx, onClose, onNeedProduct, onStarted }) => {
             </div>
           )}
 
+          <Field id="run-start" label="Production start date" type="date" icon={CalendarDays} value={startDate} onChange={(e) => setStartDate(e.target.value)} required />
+
           {product && totalPairs > 0 && (
             <div className="rounded-2xl bg-[#123A73] p-4 text-sm text-white">
               <p className="font-semibold">Materials this will need</p>
@@ -1975,6 +2096,19 @@ const PlaceChips = ({ stores, roleOf, value, onChange, allowNone }) => (
   </div>
 );
 
+// Builds the patch that tells an order line where its made pairs are, so
+// delivering the order can take them out of that place.
+const madeLinePatch = (line, { runId, madeDate, sizes, placeId, itemId }) => ({
+  ...line,
+  made: true,
+  runId,
+  madeDate,
+  sizes: Object.fromEntries(Object.entries(sizes || {}).filter(([, v]) => num(v) > 0).map(([k, v]) => [k, num(v)])),
+  stockPlaceId: placeId || null,
+  itemId: itemId || null,
+  deducted: line.deducted === true ? true : false,
+});
+
 const FinishRunModal = ({ run, ctx, onClose }) => {
   const { storeId, materials, products, stores, lists, notify, setFollowUp, roleOf } = ctx;
   const matMap = useMemo(() => Object.fromEntries(materials.map((m) => [m.id, m])), [materials]);
@@ -1988,6 +2122,7 @@ const FinishRunModal = ({ run, ctx, onClose }) => {
   const [made, setMade] = useState(Object.fromEntries(sizeKeys.map((k) => [k, String(run.sizes[k])])));
   const [costs, setCosts] = useState([]); // [{ id, name, amount }] — free-text production costs
   const [placeId, setPlaceId] = useState(ctx.defaultPlace(order));
+  const [productionDate, setProductionDate] = useState(todayStr());
   const [saving, setSaving] = useState(false);
 
   const costDefaults = lists.costDefaults || {};
@@ -2013,7 +2148,7 @@ const FinishRunModal = ({ run, ctx, onClose }) => {
   const costPerPair = madeTotal > 0 ? totalCost / madeTotal : 0;
   const missingReason = rows.some((r) => Math.abs(r.diff) > 1e-9 && !(reasons[r.materialId] || '').trim());
   const shortRows = rows.filter((r) => r.short);
-  const canSave = madeTotal > 0 && madeTotal <= run.totalPairs && !missingReason && shortRows.length === 0 && !incompleteCost;
+  const canSave = madeTotal > 0 && madeTotal <= run.totalPairs && !missingReason && shortRows.length === 0 && !incompleteCost && !!productionDate;
 
   const submit = async (e) => {
     e.preventDefault();
@@ -2039,7 +2174,7 @@ const FinishRunModal = ({ run, ctx, onClose }) => {
           reason: Math.abs(waste) > 1e-9 ? (reasons[r.materialId] || '').trim() : '',
           runId: run.id,
           runNo: label,
-          date: todayStr(),
+          date: productionDate,
           detail: `${label} · ${run.productName}`,
           createdAt: serverTimestamp(),
         });
@@ -2063,7 +2198,7 @@ const FinishRunModal = ({ run, ctx, onClose }) => {
 
       let itemId = run.itemId || null;
       if (placeId && product) {
-        itemId = await placeFinished(b, { destId: placeId, product, sizesMade: madeMap, costPerPair, label });
+        itemId = await placeFinished(b, { destId: placeId, product, sizesMade: madeMap, costPerPair, label, productionDate });
         if (product.itemId !== itemId) b.update(doc(db, 'opsProducts', product.id), { itemId });
       }
 
@@ -2081,14 +2216,17 @@ const FinishRunModal = ({ run, ctx, onClose }) => {
         costPerPair,
         placedStoreId: placeId || null,
         itemId,
-        completedDate: todayStr(),
+        productionDate,
+        completedDate: productionDate,
         completedAt: serverTimestamp(),
       });
 
-      // Mark this order line as made; the order is Ready once every line is stock-backed or made.
+      // Mark this order line as made and remember where its pairs went, so delivering
+      // the order can take them out of that place. The order is Ready once every line
+      // is stock-backed or made.
       let allDone = false;
       if (order) {
-        const lines = (order.lines || []).map((l, i) => (i === run.lineIndex ? { ...l, made: true, runId: run.id } : l));
+        const lines = (order.lines || []).map((l, i) => (i === run.lineIndex ? madeLinePatch(l, { runId: run.id, madeDate: productionDate, sizes: madeMap, placeId, itemId }) : l));
         allDone = lines.every((l) => l.source === 'stock' || l.made);
         const patch = { lines, updatedAt: serverTimestamp() };
         if (allDone && order.workStatus !== 'delivered') patch.workStatus = 'ready';
@@ -2101,12 +2239,13 @@ const FinishRunModal = ({ run, ctx, onClose }) => {
       const placeName = stores.find((s) => s.id === placeId)?.name;
       const owes = order ? num(order.totalPrice) - num(order.paid) : 0;
       const actions = [];
-      if (order && owes > 0) actions.push({ label: `Record payment from ${order.clientName}`, primary: true, onClick: () => ctx.goOrder(order.id, 'pay') });
+      if (order && allDone && placeId) actions.push({ label: `Mark ${order.orderNo} delivered`, primary: true, onClick: () => ctx.goOrder(order.id, 'deliver') });
+      if (order && owes > 0) actions.push({ label: `Record payment from ${order.clientName}`, primary: !actions.length, onClick: () => ctx.goOrder(order.id, 'pay') });
       if (!placeId) actions.push({ label: 'Place these in a store', primary: !actions.length, onClick: () => ctx.goPlace(run.id) });
       if (placeId && roleOf(placeId) !== 'factory') actions.push({ label: `See them in ${placeName}`, primary: !actions.length, onClick: () => ctx.goStock(placeId) });
       setFollowUp({
         title: `${madeTotal} pairs made`,
-        message: `Cost is ${money(costPerPair)} per pair (${money(totalCost)} in total)${rejects ? `, ${rejects} rejected` : ''}.${placeName ? ` They're now in ${placeName}${order && allDone ? ` and ${order.orderNo} is marked Ready` : ''}.` : ' They are not in a store yet.'}`,
+        message: `Produced on ${formatDate(productionDate)}. Cost is ${money(costPerPair)} per pair (${money(totalCost)} in total)${rejects ? `, ${rejects} rejected` : ''}.${placeName ? ` They're now in ${placeName} stamped ${formatDate(productionDate)}${order && allDone ? `, and ${order.orderNo} is marked Ready` : ''}.` : ' They are not in a store yet.'}${order && allDone && placeId ? ' When the client collects them, mark the order delivered and the pairs come out of stock.' : ''}`,
         question: actions.length ? 'What next?' : undefined,
         actions,
       });
@@ -2121,6 +2260,11 @@ const FinishRunModal = ({ run, ctx, onClose }) => {
     <ModalShell onClose={onClose} size="wide">
       <ModalHeader icon={Factory} title={`Finish ${run.runNo}`} subtitle={`${run.totalPairs} pairs of ${run.productName}`} onClose={onClose} />
       <form onSubmit={submit} className="space-y-5">
+        <div>
+          <Field id="fr-date" label="Production date" type="date" icon={CalendarDays} value={productionDate} onChange={(e) => setProductionDate(e.target.value)} required />
+          <p className="mt-1 text-xs text-[#8CA0BC]">When these shoes were actually made{run.startDate ? ` (started ${formatDate(run.startDate)})` : ''}. This date is stamped on the stock they create.</p>
+        </div>
+
         <div>
           <SectionLabel hint="Change a number if you used more or less">Materials actually used</SectionLabel>
           <div className="space-y-2.5">
@@ -2221,20 +2365,27 @@ const PlaceRunModal = ({ run, ctx, onClose }) => {
   const [placeId, setPlaceId] = useState(ctx.defaultPlace(run.orderId ? ctx.orders.find((o) => o.id === run.orderId) : null));
   const [saving, setSaving] = useState(false);
   const product = products.find((p) => p.id === run.productId);
+  const madeOn = run.productionDate || run.completedDate || todayStr();
 
   const submit = async () => {
     if (!placeId || !product) return;
     setSaving(true);
     try {
       const b = writeBatch(db);
-      const itemId = await placeFinished(b, { destId: placeId, product, sizesMade: run.made || {}, costPerPair: num(run.costPerPair), label: run.runNo });
+      const itemId = await placeFinished(b, { destId: placeId, product, sizesMade: run.made || {}, costPerPair: num(run.costPerPair), label: run.runNo, productionDate: madeOn });
       b.update(doc(db, 'opsRuns', run.id), { placedStoreId: placeId, itemId });
       if (product.itemId !== itemId) b.update(doc(db, 'opsProducts', product.id), { itemId });
+      // Tell the order where its pairs are, so delivering it deducts from this place.
+      const ord = run.orderId ? ctx.orders.find((o) => o.id === run.orderId) : null;
+      if (ord && ord.workStatus !== 'delivered') {
+        const lines = (ord.lines || []).map((l, i) => (i === run.lineIndex ? madeLinePatch(l, { runId: run.id, madeDate: madeOn, sizes: run.made || {}, placeId, itemId }) : l));
+        b.update(doc(db, 'opsOrders', ord.id), { lines, updatedAt: serverTimestamp() });
+      }
       await b.commit();
       onClose();
       setFollowUp({
         title: 'Shoes placed',
-        message: `${run.madeTotal} pairs are now in ${stores.find((s) => s.id === placeId)?.name}.`,
+        message: `${run.madeTotal} pairs are now in ${stores.find((s) => s.id === placeId)?.name}, stamped with their production date ${formatDate(madeOn)}.`,
         actions: roleOf(placeId) !== 'factory' ? [{ label: 'See them in stock', primary: true, onClick: () => ctx.goStock(placeId) }] : [],
       });
     } catch (err) {
@@ -2246,7 +2397,7 @@ const PlaceRunModal = ({ run, ctx, onClose }) => {
 
   return (
     <ModalShell onClose={onClose}>
-      <ModalHeader icon={Warehouse} title="Place in a store" subtitle={`${run.madeTotal} pairs · ${money(run.costPerPair)} per pair`} onClose={onClose} />
+      <ModalHeader icon={Warehouse} title="Place in a store" subtitle={`${run.madeTotal} pairs · ${money(run.costPerPair)} per pair · made ${formatDate(madeOn)}`} onClose={onClose} />
       <PlaceChips stores={stores} roleOf={roleOf} value={placeId} onChange={setPlaceId} />
       <div className="mt-5">
         <SubmitButton type="button" saving={saving} disabled={!placeId} onClick={submit}>
@@ -2263,6 +2414,7 @@ const RunSheet = ({ run, ctx, onClose, onFinish, onPlace }) => {
   const [cancelAsk, setCancelAsk] = useState(false);
   const matMap = useMemo(() => Object.fromEntries(materials.map((m) => [m.id, m])), [materials]);
   const inProgress = run.status === 'in_progress';
+  const editableWork = run.status !== 'cancelled'; // people can still be credited after a run is finished
   const doneCount = (run.steps || []).filter((s) => s.done).length;
 
   const saveSteps = async (steps) => {
@@ -2273,10 +2425,18 @@ const RunSheet = ({ run, ctx, onClose, onFinish, onPlace }) => {
     }
   };
   const toggle = (i) => saveSteps(run.steps.map((s, idx) => (idx === i ? { ...s, done: !s.done } : s)));
-  const assign = (i, staffId) => {
+  // Several people can work on one step. `doneById` / `doneBy` mirror the first person for older screens.
+  const setWorkers = (i, workers) =>
+    saveSteps(run.steps.map((s, idx) => (idx === i ? { ...s, workers, doneById: workers[0]?.staffId || '', doneBy: workers[0]?.name || '' } : s)));
+  const addWorker = (i, staffId) => {
     const person = staff.find((s) => s.id === staffId);
-    saveSteps(run.steps.map((s, idx) => (idx === i ? { ...s, doneById: staffId, doneBy: person?.fullName || '' } : s)));
+    if (!person) return;
+    const cur = stepWorkers(run.steps[i]);
+    if (cur.some((w) => w.staffId === staffId)) return;
+    setWorkers(i, [...cur, { staffId, name: person.fullName, pairs: '' }]);
   };
+  const removeWorker = (i, staffId) => setWorkers(i, stepWorkers(run.steps[i]).filter((w) => w.staffId !== staffId));
+  const setWorkerPairs = (i, staffId, pairs) => setWorkers(i, stepWorkers(run.steps[i]).map((w) => (w.staffId === staffId ? { ...w, pairs: pairs === '' ? '' : num(pairs) } : w)));
 
   const cancelRun = async () => {
     setBusy(true);
@@ -2298,6 +2458,8 @@ const RunSheet = ({ run, ctx, onClose, onFinish, onPlace }) => {
       <div className="flex flex-wrap items-center gap-2">
         <Badge tone={run.status === 'completed' ? 'green' : run.status === 'cancelled' ? 'gray' : 'blue'}>{run.status === 'completed' ? 'Completed' : run.status === 'cancelled' ? 'Cancelled' : 'In progress'}</Badge>
         <Badge tone="gray">{run.purpose === 'order' ? `For ${run.clientName} · ${run.orderNo}` : 'For the warehouse'}</Badge>
+        {run.startDate && <Badge tone="gray"><CalendarDays size={11} /> Started {formatDate(run.startDate)}</Badge>}
+        {run.status === 'completed' && (run.productionDate || run.completedDate) && <Badge tone="green"><CalendarDays size={11} /> Produced {formatDate(run.productionDate || run.completedDate)}</Badge>}
       </div>
       <div className="mt-3 flex flex-wrap gap-1.5">
         {Object.entries(run.sizes || {}).sort((a, b) => sizeSort(a[0], b[0])).map(([k, v]) => (
@@ -2307,25 +2469,61 @@ const RunSheet = ({ run, ctx, onClose, onFinish, onPlace }) => {
 
       {(run.steps || []).length > 0 && (
         <div className="mt-5">
-          <SectionLabel hint={`${doneCount}/${run.steps.length} done`}>Steps</SectionLabel>
+          <SectionLabel hint={`${doneCount}/${run.steps.length} done`}>Steps & who did them</SectionLabel>
           <div className="space-y-2">
-            {run.steps.map((s, i) => (
-              <div key={s.name} className="flex items-center gap-3 rounded-2xl border border-[#EAF0F9] bg-[#F7FAFD] px-3.5 py-2.5">
-                <button type="button" disabled={!inProgress} onClick={() => toggle(i)} className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full border-2 transition-colors ${s.done ? 'border-[#1FA97A] bg-[#1FA97A] text-white' : 'border-[#CBDBF3] bg-white text-transparent'}`} aria-label={`Mark ${s.name} done`}>
-                  <Check size={14} />
-                </button>
-                <span className={`min-w-0 flex-1 truncate text-sm font-semibold ${s.done ? 'text-[#8CA0BC] line-through' : ''}`} style={s.done ? undefined : { color: INK }}>{s.name}</span>
-                {inProgress ? (
-                  <select value={s.doneById || ''} onChange={(e) => assign(i, e.target.value)} className="max-w-[9rem] rounded-full border border-[#E1E8F4] bg-white px-2.5 py-1.5 text-xs outline-none" style={{ color: INK }}>
-                    <option value="">Who?</option>
-                    {staff.map((p) => <option key={p.id} value={p.id}>{p.fullName}</option>)}
-                  </select>
-                ) : (
-                  s.doneBy && <span className="text-xs text-[#8CA0BC]">{s.doneBy}</span>
-                )}
-              </div>
-            ))}
+            {run.steps.map((s, i) => {
+              const ws = stepWorkers(s);
+              const free = staff.filter((p) => !ws.some((w) => w.staffId === p.id));
+              return (
+                <div key={s.name} className="rounded-2xl border border-[#EAF0F9] bg-[#F7FAFD] px-3.5 py-2.5">
+                  <div className="flex items-center gap-3">
+                    <button type="button" disabled={!inProgress} onClick={() => toggle(i)} className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full border-2 transition-colors ${s.done ? 'border-[#1FA97A] bg-[#1FA97A] text-white' : 'border-[#CBDBF3] bg-white text-transparent'}`} aria-label={`Mark ${s.name} done`}>
+                      <Check size={14} />
+                    </button>
+                    <span className={`min-w-0 flex-1 truncate text-sm font-semibold ${s.done ? 'text-[#8CA0BC] line-through' : ''}`} style={s.done ? undefined : { color: INK }}>{s.name}</span>
+                    {ws.length > 0 && <span className="shrink-0 text-xs text-[#8CA0BC]">{ws.length} {ws.length === 1 ? 'person' : 'people'}</span>}
+                  </div>
+                  {(ws.length > 0 || (editableWork && free.length > 0)) && (
+                    <div className="mt-2 flex flex-wrap items-center gap-1.5 pl-10">
+                      {ws.map((w) => (
+                        <span key={w.staffId} className="flex items-center gap-1.5 rounded-full border border-[#CBDBF3] bg-white py-1 pl-2.5 pr-1.5 text-xs font-semibold text-[#2B6CDA]">
+                          {w.name || 'Team member'}
+                          {editableWork ? (
+                            <input
+                              key={`${s.name}-${w.staffId}-${w.pairs}`}
+                              type="number"
+                              min="0"
+                              inputMode="numeric"
+                              defaultValue={w.pairs ?? ''}
+                              placeholder="all"
+                              title="Pairs this person did (leave empty to share the run's pairs equally)"
+                              onBlur={(e) => e.target.value !== String(w.pairs ?? '') && setWorkerPairs(i, w.staffId, e.target.value)}
+                              className="w-12 rounded-full border border-[#E1E8F4] bg-[#F7FAFD] px-1.5 py-0.5 text-center text-xs font-semibold outline-none focus:border-[#2B6CDA]"
+                              style={{ color: INK }}
+                            />
+                          ) : (
+                            w.pairs !== '' && w.pairs != null && <span className="text-[#8CA0BC]">· {w.pairs} pairs</span>
+                          )}
+                          {editableWork && (
+                            <button type="button" onClick={() => removeWorker(i, w.staffId)} className="rounded-full p-0.5 text-[#2B6CDA]/60 hover:text-[#C0433A]" aria-label={`Remove ${w.name}`}>
+                              <X size={11} />
+                            </button>
+                          )}
+                        </span>
+                      ))}
+                      {editableWork && free.length > 0 && (
+                        <select value="" onChange={(e) => addWorker(i, e.target.value)} className="max-w-[10rem] rounded-full border border-dashed border-[#CBDBF3] bg-white px-2.5 py-1.5 text-xs outline-none" style={{ color: INK }}>
+                          <option value="">+ Add person</option>
+                          {free.map((p) => <option key={p.id} value={p.id}>{p.fullName}</option>)}
+                        </select>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
+          {staff.length > 0 && <p className="mt-2 text-xs text-[#8CA0BC]">Add everyone who worked on a step. Leave "pairs" empty to share the run's pairs equally; type a number if someone did only part. This is what Pay uses for per-pair workers.</p>}
         </div>
       )}
 
@@ -2382,7 +2580,7 @@ const RunSheet = ({ run, ctx, onClose, onFinish, onPlace }) => {
               ))}
             </div>
           )}
-          <p className="mt-3 text-sm text-[#5C7196]">{run.placedStoreId ? `Stored in ${stores.find((s) => s.id === run.placedStoreId)?.name || 'a store'}.` : 'Not placed in a store yet.'}</p>
+          <p className="mt-3 text-sm text-[#5C7196]">{run.placedStoreId ? `Stored in ${stores.find((s) => s.id === run.placedStoreId)?.name || 'a store'}, stamped ${formatDate(run.productionDate || run.completedDate)}.` : 'Not placed in a store yet.'}</p>
           {!run.placedStoreId && <div className="mt-3"><SubmitButton type="button" onClick={onPlace}><Warehouse size={15} /> Place in a store</SubmitButton></div>}
         </>
       ) : null}
@@ -2435,12 +2633,13 @@ const MakeView = ({ ctx }) => {
           <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
             {sortedRuns.filter((r) => r.status !== 'cancelled').map((r) => {
               const done = (r.steps || []).filter((s) => s.done).length;
+              const when = r.status === 'completed' ? formatDate(r.productionDate || r.completedDate) : r.startDate ? `started ${formatDate(r.startDate)}` : '';
               return (
                 <RowCard
                   key={r.id}
                   icon={Hammer}
                   title={r.productName}
-                  subtitle={`${r.runNo} · ${r.purpose === 'order' ? r.clientName : 'Warehouse'}${r.status === 'completed' ? ` · ${money(r.costPerPair)}/pair` : r.steps?.length ? ` · ${done}/${r.steps.length} steps` : ''}`}
+                  subtitle={`${r.runNo} · ${r.purpose === 'order' ? r.clientName : 'Warehouse'}${when ? ` · ${when}` : ''}${r.status === 'completed' ? ` · ${money(r.costPerPair)}/pair` : r.steps?.length ? ` · ${done}/${r.steps.length} steps` : ''}`}
                   onClick={() => setRunId(r.id)}
                   right={
                     <div className="space-y-1">
@@ -2495,9 +2694,17 @@ const MakeView = ({ ctx }) => {
 /* ==================================================================== */
 /*  ORDERS (clients are simply the names on orders)                      */
 /*                                                                       */
-/*  Each line is either TAKEN FROM STOCK (pairs are deducted from the    */
-/*  chosen place in a transaction when the order is saved) or MADE (a    */
-/*  production run is started for it). One order can mix both.           */
+/*  Each line is either FROM STOCK (pairs picked from a place) or MADE   */
+/*  (a production run is started for it). One order can mix both.        */
+/*                                                                       */
+/*  Stock only leaves the shelf when the order is marked DELIVERED:      */
+/*  that is when pairs are deducted from the place they sit in, the      */
+/*  delivery date is recorded, and a "delivered" entry is written to     */
+/*  that place's activity log. Until then pairs are "reserved" so the    */
+/*  same pairs cannot be promised to two clients.                        */
+/*                                                                       */
+/*  Every place sees every order, so orders can be tracked across the    */
+/*  whole business.                                                      */
 /* ==================================================================== */
 
 const RecordPaymentModal = ({ order, ctx, onClose }) => {
@@ -2553,11 +2760,14 @@ const RecordPaymentModal = ({ order, ctx, onClose }) => {
   );
 };
 
-// Shows what is in stock for the typed product at the chosen place and
-// lets you pick pairs per size. Looks the shared catalog item up by name.
+// Shows what is in stock for the typed product at the chosen place (minus pairs
+// already promised to other open orders) and lets you pick pairs per size.
+// Looks the shared catalog item up by name. Nothing is deducted here.
 const StockLinePicker = ({ line, ctx, onChange }) => {
   const { stores, roleOf } = ctx;
   const [loading, setLoading] = useState(false);
+  const ordersRef = useRef(ctx.orders);
+  ordersRef.current = ctx.orders;
 
   useEffect(() => {
     const name = line.product.trim();
@@ -2575,7 +2785,14 @@ const StockLinePicker = ({ line, ctx, onChange }) => {
           return;
         }
         const snap = await getDocs(query(collection(db, 'stock'), where('storeId', '==', line.placeId), where('itemId', '==', item.id)));
-        const rows = Object.fromEntries(snap.docs.map((d) => [d.data().variant, { quantity: num(d.data().quantity), avgCost: num(d.data().avgCost) }]));
+        const reserved = reservedPairs(ordersRef.current, line.placeId, item.id);
+        const rows = Object.fromEntries(
+          snap.docs.map((d) => {
+            const v = d.data().variant;
+            const onHand = num(d.data().quantity);
+            return [v, { quantity: Math.max(0, onHand - num(reserved[v])), onHand, reserved: num(reserved[v]), avgCost: num(d.data().avgCost) }];
+          })
+        );
         if (!cancelled) onChange({ avail: { itemId: item.id, rows }, sizes: {} });
       } catch (err) {
         console.error('stock lookup error:', err);
@@ -2592,6 +2809,7 @@ const StockLinePicker = ({ line, ctx, onChange }) => {
 
   const placeName = stores.find((s) => s.id === line.placeId)?.name || 'this place';
   const sizes = line.avail ? Object.entries(line.avail.rows).filter(([, r]) => r.quantity > 0).sort((a, b) => sizeSort(a[0], b[0])) : [];
+  const anyReserved = line.avail ? Object.values(line.avail.rows).some((r) => r.reserved > 0) : false;
 
   return (
     <div className="mt-2.5 space-y-2.5">
@@ -2610,10 +2828,10 @@ const StockLinePicker = ({ line, ctx, onChange }) => {
       ) : loading || !line.avail ? (
         <p className="flex items-center gap-1.5 text-xs text-[#8CA0BC]"><Loader2 size={12} className="animate-spin" /> Checking {placeName}…</p>
       ) : sizes.length === 0 ? (
-        <p className="rounded-xl bg-[#FBF0DA] px-3 py-2 text-xs font-medium text-[#8A611E]">No "{line.product.trim()}" in stock at {placeName}. Pick another place, or switch this line to Make.</p>
+        <p className="rounded-xl bg-[#FBF0DA] px-3 py-2 text-xs font-medium text-[#8A611E]">No free "{line.product.trim()}" in stock at {placeName}{anyReserved ? ' (the rest is promised to other orders)' : ''}. Pick another place, or switch this line to Make.</p>
       ) : (
         <div>
-          <p className="mb-1.5 text-xs font-medium text-[#8CA0BC]">Pairs per size — in stock at {placeName}</p>
+          <p className="mb-1.5 text-xs font-medium text-[#8CA0BC]">Pairs per size — free at {placeName}{anyReserved ? ' (after pairs promised to other orders)' : ''}</p>
           <div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
             {sizes.map(([size, r]) => {
               const v = line.sizes[size] ?? '';
@@ -2636,6 +2854,7 @@ const StockLinePicker = ({ line, ctx, onChange }) => {
               );
             })}
           </div>
+          <p className="mt-1.5 text-[11px] text-[#8CA0BC]">These pairs are set aside now and leave stock when you mark the order delivered.</p>
         </div>
       )}
     </div>
@@ -2690,71 +2909,43 @@ const OrderModal = ({ ctx, onClose }) => {
       const dep = num(deposit);
       const date = todayStr();
 
-      // Everything that touches stock happens in ONE transaction, so two
-      // devices can never take the same pairs.
-      const finalLines = await runTransaction(db, async (tx) => {
-        const reads = [];
-        valid.forEach((l, li) => {
-          if (l.mode !== 'stock') return;
-          Object.entries(l.sizes)
-            .filter(([, q]) => num(q) > 0)
-            .forEach(([size, q]) => reads.push({ li, size, qty: num(q), ref: doc(db, 'stock', stockKey(l.placeId, l.avail.itemId, size)) }));
-        });
-        const snaps = await Promise.all(reads.map((r) => tx.get(r.ref)));
-        const cost = {};
-        snaps.forEach((s, i) => {
-          const r = reads[i];
-          const have = s.exists() ? num(s.data().quantity) : 0;
-          if (have < r.qty) throw new Error(`Only ${have} pair(s) of size ${r.size} left for ${valid[r.li].product.trim()} — someone may have just taken them.`);
-          cost[r.li] = (cost[r.li] || 0) + r.qty * num(s.data().avgCost);
-        });
-        reads.forEach((r) => tx.update(r.ref, { quantity: increment(-r.qty), updatedAt: serverTimestamp() }));
-
-        const out = valid.map((l, li) => {
-          const base = { productName: l.product.trim(), productId: products.find((p) => lower(p.name) === lower(l.product))?.id || null, unitPrice: num(l.price) };
-          if (l.mode === 'stock') {
-            const sizes = Object.fromEntries(Object.entries(l.sizes).filter(([, q]) => num(q) > 0).map(([s, q]) => [s, num(q)]));
-            const pairs = linePairs(l);
-            tx.set(doc(collection(db, 'activityLog')), {
-              storeId: l.placeId,
-              itemId: l.avail.itemId,
-              type: 'sold',
-              date,
-              detail: `${orderNo} · ${client.trim()}`,
-              lineSummary: Object.entries(sizes).sort((a, b) => sizeSort(a[0], b[0])).map(([s, q]) => `${s}: -${q}`).join(', '),
-              createdAt: serverTimestamp(),
-            });
-            return { ...base, source: 'stock', stockPlaceId: l.placeId, itemId: l.avail.itemId, sizes, pairs, costPerPair: pairs ? (cost[li] || 0) / pairs : 0 };
-          }
-          return { ...base, source: 'make', made: false, sizeFrom: l.from ? parseInt(l.from, 10) : null, sizeTo: l.to ? parseInt(l.to, 10) : null, pairs: num(l.pairs) };
-        });
-
-        tx.set(ref, {
-          storeId,
-          orderNo,
-          clientName: client.trim(),
-          clientPhone: phone.trim(),
-          lines: out,
-          totalPairs: out.reduce((s, l) => s + l.pairs, 0),
-          totalPrice: total,
-          paid: dep,
-          payments: dep > 0 ? [{ amount: dep, method, date }] : [],
-          workStatus: out.every((l) => l.source === 'stock') ? 'ready' : 'waiting',
-          dueDate,
-          notes: notes.trim(),
-          createdAt: serverTimestamp(),
-        });
-        return out;
+      // Stock lines only RESERVE pairs (`deducted: false`). The pairs are taken out of
+      // stock when the order is marked delivered.
+      const out = valid.map((l) => {
+        const base = { productName: l.product.trim(), productId: products.find((p) => lower(p.name) === lower(l.product))?.id || null, unitPrice: num(l.price) };
+        if (l.mode === 'stock') {
+          const sizes = Object.fromEntries(Object.entries(l.sizes).filter(([, q]) => num(q) > 0).map(([s, q]) => [s, num(q)]));
+          return { ...base, source: 'stock', stockPlaceId: l.placeId, itemId: l.avail.itemId, sizes, pairs: linePairs(l), costPerPair: 0, deducted: false };
+        }
+        return { ...base, source: 'make', made: false, sizeFrom: l.from ? parseInt(l.from, 10) : null, sizeTo: l.to ? parseInt(l.to, 10) : null, pairs: num(l.pairs) };
       });
 
+      const b = writeBatch(db);
+      b.set(ref, {
+        storeId,
+        orderNo,
+        clientName: client.trim(),
+        clientPhone: phone.trim(),
+        lines: out,
+        totalPairs: out.reduce((s, l) => s + l.pairs, 0),
+        totalPrice: total,
+        paid: dep,
+        payments: dep > 0 ? [{ amount: dep, method, date }] : [],
+        workStatus: out.every((l) => l.source === 'stock') ? 'ready' : 'waiting',
+        dueDate,
+        notes: notes.trim(),
+        createdAt: serverTimestamp(),
+      });
+      await b.commit();
+
       onClose();
-      const makeIdx = finalLines.findIndex((l) => l.source === 'make');
-      const fromStock = finalLines.filter((l) => l.source === 'stock').reduce((s, l) => s + l.pairs, 0);
+      const makeIdx = out.findIndex((l) => l.source === 'make');
+      const reserved = out.filter((l) => l.source === 'stock').reduce((s, l) => s + l.pairs, 0);
       setFollowUp({
         title: `${orderNo} saved`,
-        message: `${client.trim()} · ${finalLines.reduce((s, l) => s + l.pairs, 0)} pairs · ${money(total)}${dep > 0 ? ` (${money(dep)} paid)` : ''}.${fromStock ? ` ${fromStock} pair(s) were taken from stock.` : ''}${makeIdx === -1 ? ' Everything is ready to hand over.' : ''}`,
-        question: makeIdx !== -1 ? 'Start making the rest now?' : undefined,
-        actions: makeIdx !== -1 ? [{ label: 'Make them', primary: true, onClick: () => ctx.goMake({ orderId: ref.id, lineIndex: makeIdx }) }] : [],
+        message: `${client.trim()} · ${out.reduce((s, l) => s + l.pairs, 0)} pairs · ${money(total)}${dep > 0 ? ` (${money(dep)} paid)` : ''}.${reserved ? ` ${reserved} pair(s) are set aside from stock and will leave it when the order is delivered.` : ''}${makeIdx === -1 ? ' Everything is ready to hand over.' : ''}`,
+        question: makeIdx !== -1 ? 'Start making the rest now?' : 'Is it being handed over today?',
+        actions: makeIdx !== -1 ? [{ label: 'Make them', primary: true, onClick: () => ctx.goMake({ orderId: ref.id, lineIndex: makeIdx }) }] : [{ label: 'Mark delivered', primary: true, onClick: () => ctx.goOrder(ref.id, 'deliver') }],
       });
     } catch (err) {
       notify({ type: 'error', message: err?.message || 'Could not save order.' });
@@ -2831,14 +3022,147 @@ const OrderModal = ({ ctx, onClose }) => {
   );
 };
 
-const OrderSheet = ({ order, ctx, onClose, onPay, initialPay }) => {
+// Marks an order delivered on a chosen date and takes the pairs out of the place
+// they are sitting in. All stock changes happen in ONE transaction, so two devices
+// can never deliver the same pairs.
+const DeliverOrderModal = ({ order, ctx, onClose }) => {
+  const { notify, setFollowUp, stores } = ctx;
+  const [date, setDate] = useState(todayStr());
+  const [note, setNote] = useState('');
+  const [saving, setSaving] = useState(false);
+  const placeName = (id) => stores.find((s) => s.id === id)?.name || 'a store';
+
+  const lines = order.lines || [];
+  const unmade = lines.filter(lineNeedsMaking);
+  const toDeduct = lines.filter((l) => l.deducted === false && l.stockPlaceId && l.itemId && Object.keys(l.sizes || {}).length);
+  const untracked = lines.filter((l) => l.source !== 'stock' && l.made && l.deducted === false && !l.stockPlaceId);
+  const balance = num(order.totalPrice) - num(order.paid);
+  const canSave = !!date && unmade.length === 0;
+
+  const submit = async () => {
+    if (!canSave) return;
+    setSaving(true);
+    try {
+      const ref = doc(db, 'opsOrders', order.id);
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(ref);
+        const o = snap.data();
+        if (['delivered', 'cancelled'].includes(o.workStatus)) throw new Error(`This order is already ${o.workStatus}.`);
+        if ((o.lines || []).some(lineNeedsMaking)) throw new Error('Some items are still to be made. Finish production first.');
+
+        const jobs = [];
+        (o.lines || []).forEach((l, li) => {
+          if (l.deducted !== false || !l.stockPlaceId || !l.itemId) return;
+          Object.entries(l.sizes || {})
+            .filter(([, q]) => num(q) > 0)
+            .forEach(([size, q]) => jobs.push({ li, size, qty: num(q), key: stockKey(l.stockPlaceId, l.itemId, size) }));
+        });
+        // Add up pairs per stock document first, so two lines of the same shoe are checked together.
+        const uniq = {};
+        jobs.forEach((j) => {
+          uniq[j.key] = uniq[j.key] || { ref: doc(db, 'stock', j.key), qty: 0 };
+          uniq[j.key].qty += j.qty;
+        });
+        const keys = Object.keys(uniq);
+        const snaps = await Promise.all(keys.map((k) => tx.get(uniq[k].ref)));
+        const data = {};
+        snaps.forEach((s, i) => {
+          const have = s.exists() ? num(s.data().quantity) : 0;
+          if (have < uniq[keys[i]].qty) {
+            const j = jobs.find((x) => x.key === keys[i]);
+            const l = o.lines[j.li];
+            throw new Error(`Only ${have} pair(s) of size ${j.size} ${l.productName} left at ${placeName(l.stockPlaceId)} — can't deliver ${uniq[keys[i]].qty}.`);
+          }
+          data[keys[i]] = s.data();
+        });
+        const cost = {};
+        jobs.forEach((j) => {
+          cost[j.li] = (cost[j.li] || 0) + j.qty * num(data[j.key].avgCost);
+        });
+
+        keys.forEach((k) => tx.update(uniq[k].ref, { quantity: increment(-uniq[k].qty), updatedAt: serverTimestamp() }));
+
+        const newLines = (o.lines || []).map((l, li) => {
+          if (l.deducted !== false || !l.stockPlaceId || !l.itemId) return l;
+          const pairs = Object.values(l.sizes || {}).reduce((s, v) => s + num(v), 0);
+          tx.set(doc(collection(db, 'activityLog')), {
+            storeId: l.stockPlaceId,
+            itemId: l.itemId,
+            type: 'delivered',
+            date,
+            detail: `${o.orderNo} · delivered to ${o.clientName}`,
+            lineSummary: Object.entries(l.sizes || {}).sort((a, b) => sizeSort(a[0], b[0])).map(([s, q]) => `${s}: -${q}`).join(', '),
+            createdAt: serverTimestamp(),
+          });
+          return { ...l, deducted: true, deliveredDate: date, costPerPair: pairs ? (cost[li] || 0) / pairs : 0 };
+        });
+
+        tx.update(ref, { lines: newLines, workStatus: 'delivered', deliveredDate: date, deliveryNote: note.trim(), updatedAt: serverTimestamp() });
+      });
+      onClose();
+      const pairsOut = toDeduct.reduce((s, l) => s + Object.values(l.sizes || {}).reduce((t, v) => t + num(v), 0), 0);
+      setFollowUp({
+        title: `${order.orderNo} delivered`,
+        message: `Delivered to ${order.clientName} on ${formatDate(date)}.${pairsOut ? ` ${pairsOut} pair(s) were taken out of stock.` : ''}${balance > 0.001 ? ` ${order.clientName} still owes ${money(balance)}.` : ''}`,
+        question: balance > 0.001 ? 'Did they pay now?' : undefined,
+        actions: balance > 0.001 ? [{ label: 'Record payment', primary: true, onClick: () => ctx.goOrder(order.id, 'pay') }] : [],
+      });
+    } catch (err) {
+      notify({ type: 'error', message: err?.message || 'Could not mark delivered.' });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <ModalShell onClose={onClose}>
+      <ModalHeader icon={PackageCheck} title="Mark delivered" subtitle={`${order.clientName} · ${order.orderNo}`} onClose={onClose} />
+      <div className="space-y-4">
+        {unmade.length > 0 && (
+          <p className="flex items-start gap-2 rounded-2xl border border-[#F5D3CE] bg-[#FBEAE8]/60 px-4 py-3 text-sm text-[#8A342C]">
+            <AlertTriangle size={14} className="mt-0.5 shrink-0" /> {unmade.map((l) => l.productName).join(', ')} still needs making. Finish production first.
+          </p>
+        )}
+        <Field id="dv-date" label="Delivery date" type="date" icon={CalendarDays} value={date} onChange={(e) => setDate(e.target.value)} required />
+
+        <div>
+          <SectionLabel>Coming out of stock</SectionLabel>
+          {toDeduct.length === 0 ? (
+            <p className="rounded-2xl bg-[#F7FAFD] px-4 py-3 text-sm text-[#5C7196]">No stock to take out — nothing on this order is waiting to be deducted.</p>
+          ) : (
+            <div className="space-y-1.5">
+              {toDeduct.map((l, i) => (
+                <div key={i} className="rounded-xl border border-[#EAF0F9] bg-[#F7FAFD] px-3.5 py-2 text-sm">
+                  <div className="flex justify-between gap-2"><span className="font-semibold" style={{ color: INK }}>{l.productName}</span><span className="text-xs text-[#8CA0BC]">from {placeName(l.stockPlaceId)}</span></div>
+                  <p className="text-xs font-semibold text-[#2B6CDA]">{Object.entries(l.sizes).sort((a, b) => sizeSort(a[0], b[0])).map(([s, q]) => `${s} × ${q}`).join(' · ')}</p>
+                </div>
+              ))}
+            </div>
+          )}
+          {untracked.length > 0 && <p className="mt-2 text-xs font-medium text-[#B9812E]">{untracked.map((l) => l.productName).join(', ')} was made but never placed in a store, so nothing is deducted for it.</p>}
+        </div>
+
+        <Field id="dv-note" label="Received by / note (optional)" icon={StickyNote} value={note} onChange={(e) => setNote(e.target.value)} placeholder="e.g. collected by the headteacher" />
+        {balance > 0.001 && <p className="text-sm font-medium text-[#B9812E]">{order.clientName} still owes {money(balance)} — you can record that after.</p>}
+
+        <SubmitButton type="button" saving={saving} disabled={!canSave} onClick={submit}>
+          <PackageCheck size={15} /> Confirm delivery
+        </SubmitButton>
+      </div>
+    </ModalShell>
+  );
+};
+
+const OrderSheet = ({ order, ctx, onClose, onPay, onDeliver, initialPay, initialDeliver }) => {
   const { notify, setFollowUp, stores } = ctx;
   const [busy, setBusy] = useState(false);
   const [cancelAsk, setCancelAsk] = useState(false);
   useEffect(() => {
     if (initialPay) onPay();
+    else if (initialDeliver) onDeliver();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const cancelled = order.workStatus === 'cancelled';
+  const delivered = order.workStatus === 'delivered';
   const balance = num(order.totalPrice) - num(order.paid);
   const [mTone, mLabel] = MONEY_BADGE[payStatus(num(order.paid), num(order.totalPrice))];
   const overdue = order.dueDate && order.dueDate < todayStr() && !['delivered', 'cancelled'].includes(order.workStatus);
@@ -2846,16 +3170,11 @@ const OrderSheet = ({ order, ctx, onClose, onPay, initialPay }) => {
   const placeName = (id) => stores.find((s) => s.id === id)?.name || 'a store';
 
   const setStatus = async (status) => {
-    if (status === order.workStatus) return;
+    if (status === order.workStatus || status === 'delivered') return;
     setBusy(true);
     try {
       await updateDoc(doc(db, 'opsOrders', order.id), { workStatus: status, updatedAt: serverTimestamp() });
-      if (status === 'delivered' && balance > 0.001) {
-        onClose();
-        setFollowUp({ title: 'Marked delivered', message: `${order.clientName} still owes ${money(balance)} on ${order.orderNo}.`, question: 'Did they pay now?', actions: [{ label: 'Record payment', primary: true, onClick: () => ctx.goOrder(order.id, 'pay') }] });
-      } else {
-        notify({ type: 'success', message: `${order.orderNo} is now ${WORK_BADGE[status][1].toLowerCase()}.` });
-      }
+      notify({ type: 'success', message: `${order.orderNo} is now ${WORK_BADGE[status][1].toLowerCase()}.` });
     } catch (err) {
       notify({ type: 'error', message: err?.message || 'Could not update.' });
     } finally {
@@ -2863,7 +3182,8 @@ const OrderSheet = ({ order, ctx, onClose, onPay, initialPay }) => {
     }
   };
 
-  // Puts pairs taken from stock back, then marks the order cancelled.
+  // Cancelling is blocked once delivered. Pairs are only reserved until delivery, so nothing
+  // needs putting back — except on orders saved before v3, which took their stock when saved.
   const cancelOrder = async () => {
     setBusy(true);
     try {
@@ -2875,7 +3195,7 @@ const OrderSheet = ({ order, ctx, onClose, onPay, initialPay }) => {
         const snap = await tx.get(ref);
         const o = snap.data();
         if (['delivered', 'cancelled'].includes(o.workStatus)) throw new Error(`This order is already ${o.workStatus}.`);
-        (o.lines || []).filter((l) => l.source === 'stock').forEach((l) => {
+        (o.lines || []).filter((l) => l.source === 'stock' && l.deducted === undefined).forEach((l) => {
           Object.entries(l.sizes || {}).forEach(([size, q]) => {
             tx.set(doc(db, 'stock', stockKey(l.stockPlaceId, l.itemId, size)), { storeId: l.stockPlaceId, itemId: l.itemId, variant: size, quantity: increment(num(q)), updatedAt: serverTimestamp() }, { merge: true });
           });
@@ -2893,13 +3213,25 @@ const OrderSheet = ({ order, ctx, onClose, onPay, initialPay }) => {
       });
       setCancelAsk(false);
       onClose();
-      setFollowUp({ title: `${order.orderNo} cancelled`, message: 'Any pairs taken from stock were put back. Pairs already made for this order stay in stock.', actions: [] });
+      setFollowUp({ title: `${order.orderNo} cancelled`, message: 'Pairs that were set aside for this order are free again. Pairs already made for it stay in stock.', actions: [] });
     } catch (err) {
       notify({ type: 'error', message: err?.message || 'Could not cancel.' });
       setCancelAsk(false);
     } finally {
       setBusy(false);
     }
+  };
+
+  const lineBadge = (l) => {
+    if (l.source === 'stock' || l.made) {
+      const where = l.stockPlaceId ? placeName(l.stockPlaceId) : null;
+      const base = l.source === 'stock' ? 'From stock' : 'Made';
+      if (l.deducted === true) return <Badge tone="gray"><PackageCheck size={11} /> Delivered · taken from {where}</Badge>;
+      if (l.deducted === false && where) return <Badge tone="green"><Warehouse size={11} /> {base} · set aside at {where}</Badge>;
+      if (l.deducted === false) return <Badge tone="amber"><Hammer size={11} /> Made · not in a store</Badge>;
+      return <Badge tone="green"><Warehouse size={11} /> {base}{where ? ` · ${where}` : ''}</Badge>;
+    }
+    return <Badge tone="blue"><Hammer size={11} /> To make</Badge>;
   };
 
   return (
@@ -2909,6 +3241,7 @@ const OrderSheet = ({ order, ctx, onClose, onPay, initialPay }) => {
         <Badge tone={WORK_BADGE[order.workStatus][0]}>{WORK_BADGE[order.workStatus][1]}</Badge>
         {!cancelled && <Badge tone={mTone}>{mLabel}</Badge>}
         {order.dueDate && <Badge tone={overdue ? 'red' : 'gray'}><CalendarDays size={11} /> {overdue ? 'Overdue · ' : 'Due '}{formatDate(order.dueDate)}</Badge>}
+        {delivered && order.deliveredDate && <Badge tone="green"><PackageCheck size={11} /> Delivered {formatDate(order.deliveredDate)}</Badge>}
       </div>
 
       <div className="mt-4 space-y-2">
@@ -2917,12 +3250,13 @@ const OrderSheet = ({ order, ctx, onClose, onPay, initialPay }) => {
             <div className="flex justify-between gap-2"><span className="font-semibold" style={{ color: INK }}>{l.productName}</span><span className="font-semibold" style={{ color: INK }}>{money(l.pairs * l.unitPrice)}</span></div>
             <p className="text-xs text-[#8CA0BC]">
               {l.pairs} pairs · {money(l.unitPrice)} each
-              {l.source === 'stock' && ` · sizes ${Object.entries(l.sizes || {}).sort((a, b) => sizeSort(a[0], b[0])).map(([s, q]) => `${s}×${q}`).join(', ')}`}
-              {l.source !== 'stock' && l.sizeFrom ? ` · sizes ${l.sizeFrom}–${l.sizeTo}` : ''}
+              {Object.keys(l.sizes || {}).length > 0 && ` · sizes ${Object.entries(l.sizes).sort((a, b) => sizeSort(a[0], b[0])).map(([s, q]) => `${s}×${q}`).join(', ')}`}
+              {l.source !== 'stock' && !Object.keys(l.sizes || {}).length && l.sizeFrom ? ` · sizes ${l.sizeFrom}–${l.sizeTo}` : ''}
+              {l.madeDate ? ` · made ${formatDate(l.madeDate)}` : ''}
             </p>
             <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-              {l.source === 'stock' ? <Badge tone="green"><Warehouse size={11} /> From stock · {placeName(l.stockPlaceId)}</Badge> : l.made ? <Badge tone="green"><Hammer size={11} /> Made</Badge> : <Badge tone="blue"><Hammer size={11} /> To make</Badge>}
-              {l.source === 'stock' && num(l.costPerPair) > 0 && <span className="text-[11px] text-[#8CA0BC]">Profit {money(l.pairs * (l.unitPrice - l.costPerPair))}</span>}
+              {lineBadge(l)}
+              {l.deducted === true && num(l.costPerPair) > 0 && <span className="text-[11px] text-[#8CA0BC]">Profit {money(l.pairs * (l.unitPrice - l.costPerPair))}</span>}
             </div>
           </div>
         ))}
@@ -2940,7 +3274,7 @@ const OrderSheet = ({ order, ctx, onClose, onPay, initialPay }) => {
           <div className="space-y-1.5">
             {order.payments.map((p, i) => (
               <div key={i} className="flex items-center justify-between rounded-xl border border-[#EAF0F9] bg-[#F7FAFD] px-3.5 py-2 text-sm">
-                <span className="text-[#5C7196]">{formatDate(p.date)} · {PAY_METHODS.find((m) => m.id === p.method)?.label || p.method}</span>
+                <span className="text-[#5C7196]">{formatDate(p.date)} · {methodLabel(p.method)}</span>
                 <span className="font-semibold" style={{ color: INK }}>{money(p.amount)}</span>
               </div>
             ))}
@@ -2948,30 +3282,32 @@ const OrderSheet = ({ order, ctx, onClose, onPay, initialPay }) => {
         </div>
       )}
       {order.notes && <p className="mt-3 rounded-xl bg-[#F7FAFD] px-3.5 py-2.5 text-sm italic text-[#5C7196]">{order.notes}</p>}
+      {delivered && order.deliveryNote && <p className="mt-3 rounded-xl bg-[#F7FAFD] px-3.5 py-2.5 text-sm text-[#5C7196]">Delivery note: {order.deliveryNote}</p>}
 
       {!cancelled && (
         <>
           <div className="mt-5">
-            <SectionLabel>Where is the work?</SectionLabel>
+            <SectionLabel hint={delivered ? 'Delivered orders are locked' : 'Delivered takes the pairs out of stock'}>Where is the work?</SectionLabel>
             <div className="grid grid-cols-4 gap-1.5">
               {WORK_FLOW.map((s) => (
-                <button key={s} type="button" disabled={busy} onClick={() => setStatus(s)} className={`rounded-xl border-2 px-1 py-2.5 text-xs font-semibold leading-tight transition-colors ${order.workStatus === s ? 'border-[#2B6CDA] bg-[#EAF2FE] text-[#2B6CDA]' : 'border-[#E1E8F4] bg-white text-[#8CA0BC]'}`}>
+                <button key={s} type="button" disabled={busy || delivered} onClick={() => (s === 'delivered' ? onDeliver() : setStatus(s))} className={`rounded-xl border-2 px-1 py-2.5 text-xs font-semibold leading-tight transition-colors disabled:opacity-60 ${order.workStatus === s ? 'border-[#2B6CDA] bg-[#EAF2FE] text-[#2B6CDA]' : 'border-[#E1E8F4] bg-white text-[#8CA0BC]'}`}>
                   {WORK_BADGE[s][1]}
                 </button>
               ))}
             </div>
           </div>
 
-          <div className="mt-5 flex gap-2.5">
+          <div className="mt-5 flex flex-wrap gap-2.5">
+            {!delivered && <SoftButton icon={PackageCheck} onClick={onDeliver}>Mark delivered</SoftButton>}
             {balance > 0.001 && <SoftButton icon={Banknote} onClick={onPay}>Record payment</SoftButton>}
             {['waiting', 'making'].includes(order.workStatus) && firstMake !== -1 && <SoftButton icon={Hammer} onClick={() => { onClose(); ctx.goMake({ orderId: order.id, lineIndex: firstMake }); }}>Make these</SoftButton>}
           </div>
-          {order.workStatus !== 'delivered' && <button type="button" onClick={() => setCancelAsk(true)} className="mt-3 w-full py-2 text-sm font-semibold text-[#C0433A]">Cancel this order</button>}
+          {!delivered && <button type="button" onClick={() => setCancelAsk(true)} className="mt-3 w-full py-2 text-sm font-semibold text-[#C0433A]">Cancel this order</button>}
         </>
       )}
 
       <AnimatePresence>
-        {cancelAsk && <ConfirmDialog title="Cancel this order?" body="Pairs taken from stock go back on the shelf. Pairs already made for this order stay in stock. It is blocked if the client has paid anything or a run is still in progress." confirmLabel="Cancel order" saving={busy} onCancel={() => setCancelAsk(false)} onConfirm={cancelOrder} />}
+        {cancelAsk && <ConfirmDialog title="Cancel this order?" body="Pairs set aside for this order become free again, and pairs already made for it stay in stock. It is blocked if the client has paid anything or a run is still in progress." confirmLabel="Cancel order" saving={busy} onCancel={() => setCancelAsk(false)} onConfirm={cancelOrder} />}
       </AnimatePresence>
     </ModalShell>
   );
@@ -2985,13 +3321,16 @@ const OrdersView = ({ ctx }) => {
   const [addOpen, setAddOpen] = useState(false);
   const [openId, setOpenId] = useState(null);
   const [initialPay, setInitialPay] = useState(false);
+  const [initialDeliver, setInitialDeliver] = useState(false);
   const [payId, setPayId] = useState(null);
+  const [deliverId, setDeliverId] = useState(null);
   const [clientKey, setClientKey] = useState(null);
 
   useEffect(() => {
     if (intent?.type === 'order') {
       setOpenId(intent.orderId);
       setInitialPay(intent.mode === 'pay');
+      setInitialDeliver(intent.mode === 'deliver');
       clearIntent();
     }
   }, [intent]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -3025,6 +3364,7 @@ const OrdersView = ({ ctx }) => {
 
   const openOrder = orders.find((o) => o.id === openId);
   const payOrder = orders.find((o) => o.id === payId);
+  const deliverOrder = orders.find((o) => o.id === deliverId);
   const client = clients.find((c) => c.key === clientKey);
   const owedTotal = clients.reduce((s, c) => s + Math.max(0, c.owed), 0);
   const placeName = (id) => stores.find((s) => s.id === id)?.name;
@@ -3060,7 +3400,7 @@ const OrdersView = ({ ctx }) => {
                     key={o.id}
                     icon={ClipboardList}
                     title={o.clientName}
-                    subtitle={`${o.orderNo} · ${o.totalPairs} pairs${o.dueDate ? ` · due ${formatDate(o.dueDate)}` : ''}${o.storeId !== storeId && placeName(o.storeId) ? ` · ${placeName(o.storeId)}` : ''}`}
+                    subtitle={`${o.orderNo} · ${o.totalPairs} pairs${o.workStatus === 'delivered' && o.deliveredDate ? ` · delivered ${formatDate(o.deliveredDate)}` : o.dueDate ? ` · due ${formatDate(o.dueDate)}` : ''}${o.storeId !== storeId && placeName(o.storeId) ? ` · ${placeName(o.storeId)}` : ''}`}
                     tone={overdue ? 'red' : undefined}
                     onClick={() => setOpenId(o.id)}
                     right={
@@ -3089,9 +3429,20 @@ const OrdersView = ({ ctx }) => {
 
       <AnimatePresence>{addOpen && <OrderModal ctx={ctx} onClose={() => setAddOpen(false)} />}</AnimatePresence>
       <AnimatePresence>
-        {openOrder && <OrderSheet order={openOrder} ctx={ctx} initialPay={initialPay} onClose={() => { setOpenId(null); setInitialPay(false); }} onPay={() => { setInitialPay(false); setPayId(openOrder.id); }} />}
+        {openOrder && (
+          <OrderSheet
+            order={openOrder}
+            ctx={ctx}
+            initialPay={initialPay}
+            initialDeliver={initialDeliver}
+            onClose={() => { setOpenId(null); setInitialPay(false); setInitialDeliver(false); }}
+            onPay={() => { setInitialPay(false); setPayId(openOrder.id); }}
+            onDeliver={() => { setInitialDeliver(false); setDeliverId(openOrder.id); }}
+          />
+        )}
       </AnimatePresence>
       <AnimatePresence>{payOrder && <RecordPaymentModal order={payOrder} ctx={ctx} onClose={() => setPayId(null)} />}</AnimatePresence>
+      <AnimatePresence>{deliverOrder && <DeliverOrderModal order={deliverOrder} ctx={ctx} onClose={() => setDeliverId(null)} />}</AnimatePresence>
       <AnimatePresence>
         {client && (
           <ModalShell onClose={() => setClientKey(null)}>
@@ -3105,7 +3456,7 @@ const OrdersView = ({ ctx }) => {
                 const bal = num(o.totalPrice) - num(o.paid);
                 return (
                   <button key={o.id} type="button" onClick={() => { setClientKey(null); setOpenId(o.id); }} className="flex w-full items-center justify-between gap-3 rounded-2xl border border-[#EAF0F9] bg-[#F7FAFD] px-4 py-3 text-left">
-                    <span className="min-w-0"><span className="block truncate text-sm font-semibold" style={{ color: INK }}>{o.orderNo} · {o.totalPairs} pairs</span><span className="block text-xs text-[#8CA0BC]">{WORK_BADGE[o.workStatus][1]} · {money(o.totalPrice)}</span></span>
+                    <span className="min-w-0"><span className="block truncate text-sm font-semibold" style={{ color: INK }}>{o.orderNo} · {o.totalPairs} pairs</span><span className="block text-xs text-[#8CA0BC]">{WORK_BADGE[o.workStatus][1]}{o.workStatus === 'delivered' && o.deliveredDate ? ` ${formatDate(o.deliveredDate)}` : ''} · {money(o.totalPrice)}</span></span>
                     <span className={`text-xs font-semibold ${bal > 0.001 ? 'text-[#C0433A]' : 'text-[#168A63]'}`}>{bal > 0.001 ? `Owes ${money(bal)}` : 'Paid'}</span>
                   </button>
                 );
@@ -3245,7 +3596,10 @@ const CountStockModal = ({ row, ctx, onClose }) => {
 const MoveStockModal = ({ row, ctx, onClose }) => {
   const { storeId, stores, roleOf, notify, setFollowUp } = ctx;
   const { item, storeItem, stockRows } = row;
-  const available = stockRows.filter((r) => num(r.quantity) > 0);
+  // Pairs promised to open orders can't be moved away.
+  const reserved = useMemo(() => reservedPairs(ctx.orders, storeId, item.id), [ctx.orders, storeId, item.id]);
+  const free = (r) => Math.max(0, num(r.quantity) - num(reserved[r.variant]));
+  const available = stockRows.filter((r) => free(r) > 0);
   const others = stores.filter((s) => s.id !== storeId);
   const [destId, setDestId] = useState('');
   const [qty, setQty] = useState({});
@@ -3253,7 +3607,7 @@ const MoveStockModal = ({ row, ctx, onClose }) => {
 
   const moves = available.filter((r) => num(qty[r.variant]) > 0).map((r) => ({ ...r, q: num(qty[r.variant]) }));
   const total = moves.reduce((s, m) => s + m.q, 0);
-  const canSave = destId && total > 0 && moves.every((m) => m.q <= num(m.quantity));
+  const canSave = destId && total > 0 && moves.every((m) => m.q <= free(m));
   const destName = stores.find((s) => s.id === destId)?.name;
 
   const submit = async (e) => {
@@ -3276,7 +3630,10 @@ const MoveStockModal = ({ row, ctx, onClose }) => {
         moves.forEach((m, i) => {
           tx.update(srcRefs[i], { quantity: increment(-m.q), updatedAt: serverTimestamp() });
           const d = dstSnaps[i].exists() ? dstSnaps[i].data() : null;
-          const payload = { storeId: destId, itemId: item.id, variant: m.variant, quantity: increment(m.q), avgCost: blendAvg(d?.quantity, d?.avgCost, m.q, srcSnaps[i].data().avgCost), updatedAt: serverTimestamp() };
+          const src = srcSnaps[i].data();
+          const payload = { storeId: destId, itemId: item.id, variant: m.variant, quantity: increment(m.q), avgCost: blendAvg(d?.quantity, d?.avgCost, m.q, src.avgCost), updatedAt: serverTimestamp() };
+          // Keep the production date with the pairs when they move.
+          if (src.lastProductionDate) payload.lastProductionDate = src.lastProductionDate;
           if (!d) payload.createdAt = serverTimestamp();
           tx.set(dstRefs[i], payload, { merge: true });
         });
@@ -3322,12 +3679,12 @@ const MoveStockModal = ({ row, ctx, onClose }) => {
             <PlaceChips stores={others} roleOf={roleOf} value={destId} onChange={setDestId} />
           </div>
           <div>
-            <SectionLabel>Pairs per size</SectionLabel>
+            <SectionLabel hint="Pairs promised to open orders can't be moved">Pairs per size</SectionLabel>
             <div className="grid grid-cols-3 gap-2">
               {available.map((r) => (
                 <div key={r.variant} className="rounded-xl border border-[#E1E8F4] bg-white px-2 py-1.5 text-center">
-                  <p className="text-[11px] font-semibold text-[#8CA0BC]">Size {r.variant} <span className="font-normal">/{r.quantity}</span></p>
-                  <input type="number" min="0" max={r.quantity} inputMode="numeric" value={qty[r.variant] ?? ''} onChange={(e) => setQty((q) => ({ ...q, [r.variant]: e.target.value }))} placeholder="0" className="w-full bg-transparent text-center text-[15px] font-semibold outline-none" style={{ color: INK }} />
+                  <p className="text-[11px] font-semibold text-[#8CA0BC]">Size {r.variant} <span className="font-normal">/{free(r)}</span></p>
+                  <input type="number" min="0" max={free(r)} inputMode="numeric" value={qty[r.variant] ?? ''} onChange={(e) => setQty((q) => ({ ...q, [r.variant]: e.target.value }))} placeholder="0" className="w-full bg-transparent text-center text-[15px] font-semibold outline-none" style={{ color: INK }} />
                 </div>
               ))}
             </div>
@@ -3349,6 +3706,9 @@ const StockItemSheet = ({ row, ctx, onClose, onMove, onCount, onEdit }) => {
   const st = stockState(row);
   const avgCost = st.qty > 0 ? stockRows.reduce((s, r) => s + num(r.quantity) * num(r.avgCost), 0) / st.qty : 0;
   const attrs = attrText(item);
+  const reserved = useMemo(() => reservedPairs(ctx.orders, storeId, item.id), [ctx.orders, storeId, item.id]);
+  const reservedTotal = Object.values(reserved).reduce((s, v) => s + num(v), 0);
+  const lastMade = stockRows.map((r) => r.lastProductionDate).filter(Boolean).sort().pop();
 
   useEffect(() => {
     let cancelled = false;
@@ -3377,6 +3737,15 @@ const StockItemSheet = ({ row, ctx, onClose, onMove, onCount, onEdit }) => {
           {st.out ? 'Out of stock.' : `Running low — at or below ${st.threshold} pairs.`}
         </div>
       )}
+      {reservedTotal > 0 && (
+        <div className="mt-3 flex items-center gap-2 rounded-2xl border border-[#CBDBF3] bg-[#EAF2FE]/60 px-4 py-3 text-sm text-[#2B6CDA]">
+          <ClipboardList size={14} className="shrink-0" />
+          {reservedTotal} pair{reservedTotal !== 1 ? 's are' : ' is'} set aside for open orders — they leave stock when those orders are delivered.
+        </div>
+      )}
+      {lastMade && (
+        <p className="mt-3 flex items-center gap-1.5 text-xs font-medium text-[#5C7196]"><CalendarDays size={12} /> Last produced {formatDate(lastMade)}</p>
+      )}
       {(item.attributes || []).length > 0 && (
         <div className="mt-3 flex flex-wrap gap-1.5">
           {item.attributes.map((a, i) => (
@@ -3397,9 +3766,10 @@ const StockItemSheet = ({ row, ctx, onClose, onMove, onCount, onEdit }) => {
           {stockRows.map((r) => {
             const out = num(r.quantity) <= 0;
             const low = !out && st.threshold > 0 && num(r.quantity) <= st.threshold;
+            const held = num(reserved[r.variant]);
             return (
               <span key={r.variant} className={`rounded-lg border px-2.5 py-1 text-xs font-semibold ${out ? 'border-[#F5D3CE] bg-[#FBEAE8] text-[#C0433A]' : low ? 'border-[#F0DCAF] bg-[#FBF0DA] text-[#B9812E]' : 'border-[#E1E8F4] bg-[#F7FAFD] text-[#2B6CDA]'}`}>
-                {r.variant} × {r.quantity}{out ? ' · Out' : low ? ' · Low' : ''}
+                {r.variant} × {r.quantity}{out ? ' · Out' : low ? ' · Low' : ''}{held > 0 ? ` · ${held} set aside` : ''}
               </span>
             );
           })}
@@ -3706,6 +4076,13 @@ const MachinesView = ({ ctx }) => {
 
 /* ==================================================================== */
 /*  PAY                                                                  */
+/*                                                                       */
+/*  Monthly / weekly people are paid a typed amount. PER-PAIR people are */
+/*  paid from their real work: pick the date range, and every step of    */
+/*  every finished production run they were credited on is listed with   */
+/*  its pairs and the rate for that service. Tick what you are paying,   */
+/*  fix a pair count if needed, or add your own line. Work already paid  */
+/*  is marked and cannot be paid twice.                                  */
 /* ==================================================================== */
 
 const PAY_STYLES = [
@@ -3721,33 +4098,116 @@ const weekStart = (d) => {
   return x.toISOString().slice(0, 10);
 };
 
-const PayModal = ({ person, ctx, onClose, onSaved }) => {
-  const { storeId, runs, notify, setFollowUp } = ctx;
+const PayModal = ({ person, payments, ctx, onClose, onSaved }) => {
+  const { storeId, runs, lists, notify, setFollowUp } = ctx;
   const style = person.payStyle || 'monthly';
   const [date, setDate] = useState(todayStr());
-  const [label, setLabel] = useState(style === 'weekly' ? `Week of ${formatDate(weekStart(todayStr()))}` : new Date().toLocaleDateString(undefined, { month: 'long', year: 'numeric' }));
-  const suggestion = useMemo(() => {
-    if (style !== 'piece') return num(person.payRate);
-    const from = `${todayStr().slice(0, 7)}-01`;
-    const pairs = runs.filter((r) => r.status === 'completed' && (r.completedDate || '') >= from && (r.steps || []).some((s) => s.doneById === person.id)).reduce((s, r) => s + num(r.madeTotal), 0);
-    return pairs * num(person.payRate);
-  }, [style, runs, person]);
-  const [amount, setAmount] = useState(suggestion ? String(suggestion) : '');
+  const [from, setFrom] = useState(`${todayStr().slice(0, 7)}-01`);
+  const [to, setTo] = useState(todayStr());
+  const [label, setLabel] = useState(
+    style === 'weekly'
+      ? `Week of ${formatDate(weekStart(todayStr()))}`
+      : style === 'piece'
+      ? `${new Date().toLocaleDateString(undefined, { month: 'long', year: 'numeric' })} · per pair`
+      : new Date().toLocaleDateString(undefined, { month: 'long', year: 'numeric' })
+  );
+  const [picked, setPicked] = useState({}); // key -> { on, pairs }
+  const [manual, setManual] = useState([]); // [{ id, service, pairs, rate }]
+  const [amountInput, setAmountInput] = useState(style === 'piece' ? null : person.payRate ? String(person.payRate) : '');
   const [method, setMethod] = useState('cash');
   const [note, setNote] = useState('');
   const [saving, setSaving] = useState(false);
 
+  const rateFor = (service) => {
+    const hit = (person.payServices || []).find((s) => lower(s.name) === lower(service));
+    return hit ? num(hit.rate) : num(person.payRate);
+  };
+  const serviceOptions = useMemo(
+    () => dedupeSorted([...DEFAULT_STEPS, ...(lists.steps || []), ...(person.payServices || []).map((s) => s.name)]),
+    [lists.steps, person.payServices]
+  );
+
+  // Work already paid to this person, so it is never paid twice.
+  const paidKeys = useMemo(
+    () => new Set(payments.filter((p) => p.staffId === person.id).flatMap((p) => (p.items || []).filter((i) => i.runId).map((i) => `${i.runId}__${slugify(i.service)}`))),
+    [payments, person.id]
+  );
+
+  // Every step this person was credited on, in finished runs inside the date range.
+  const work = useMemo(() => {
+    if (style !== 'piece') return [];
+    return runs
+      .filter((r) => r.status === 'completed' && (r.completedDate || '') >= from && (r.completedDate || '') <= to)
+      .flatMap((r) =>
+        (r.steps || [])
+          .map((step) => ({ r, step, w: stepWorkers(step).find((x) => x.staffId === person.id) }))
+          .filter((x) => x.w)
+          .map(({ r: run, step, w }) => ({ key: `${run.id}__${slugify(step.name)}`, run, service: step.name, pairs: creditedPairs(step, w, run), rate: rateFor(step.name) }))
+      )
+      .sort((a, b) => (b.run.completedDate || '').localeCompare(a.run.completedDate || ''));
+  }, [runs, style, from, to, person]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const isPaid = (row) => paidKeys.has(row.key);
+  const rowOn = (row) => !isPaid(row) && (picked[row.key]?.on ?? true);
+  const rowPairs = (row) => picked[row.key]?.pairs ?? qtyFmt(row.pairs);
+  const setPick = (row, patch) => setPicked((p) => ({ ...p, [row.key]: { on: rowOn(row), pairs: rowPairs(row), ...p[row.key], ...patch } }));
+
+  const selected = work.filter(rowOn).map((r) => ({ ...r, pairs: num(rowPairs(r)) })).filter((r) => r.pairs > 0);
+  const manualFilled = manual.filter((m) => m.service.trim() || m.pairs !== '' || m.rate !== '');
+  const manualValid = manualFilled.filter((m) => m.service.trim() && num(m.pairs) > 0 && m.rate !== '' && num(m.rate) >= 0);
+  const incompleteManual = manualFilled.length !== manualValid.length;
+  const workTotal = selected.reduce((s, r) => s + r.pairs * r.rate, 0);
+  const manualTotal = manualValid.reduce((s, m) => s + num(m.pairs) * num(m.rate), 0);
+  const computed = workTotal + manualTotal;
+  const amount = style === 'piece' ? amountInput ?? String(Number(computed.toFixed(2))) : amountInput;
+  const pairsTotal = selected.reduce((s, r) => s + r.pairs, 0) + manualValid.reduce((s, m) => s + num(m.pairs), 0);
+
+  const setManualRow = (id, patch) => setManual((m) => m.map((x) => (x.id === id ? { ...x, ...patch } : x)));
+  const pickService = (id, v) => {
+    const row = manual.find((x) => x.id === id);
+    setManualRow(id, { service: v, ...(row && row.rate === '' && serviceOptions.some((o) => lower(o) === lower(v)) && rateFor(v) > 0 ? { rate: String(rateFor(v)) } : {}) });
+  };
+
+  const canSave = num(amount) > 0 && !incompleteManual && !!label.trim();
+
   const submit = async (e) => {
     e.preventDefault();
-    if (num(amount) <= 0) return;
+    if (!canSave) return;
     setSaving(true);
     try {
-      await writeBatch(db)
-        .set(doc(collection(db, 'opsPayroll')), { storeId, staffId: person.id, staffName: person.fullName, payStyle: style, period: label.trim(), amount: num(amount), method, date, note: note.trim(), createdAt: serverTimestamp() })
-        .commit();
+      const items =
+        style === 'piece'
+          ? [
+              ...selected.map((r) => ({ source: 'production', runId: r.run.id, runNo: r.run.runNo, productName: r.run.productName, service: r.service, pairs: r.pairs, rate: r.rate, amount: r.pairs * r.rate })),
+              ...manualValid.map((m) => ({ source: 'manual', service: m.service.trim(), pairs: num(m.pairs), rate: num(m.rate), amount: num(m.pairs) * num(m.rate) })),
+            ]
+          : [];
+      const b = writeBatch(db);
+      b.set(doc(collection(db, 'opsPayroll')), {
+        storeId,
+        staffId: person.id,
+        staffName: person.fullName,
+        payStyle: style,
+        period: label.trim(),
+        amount: num(amount),
+        method,
+        date,
+        note: note.trim(),
+        items,
+        pairsTotal,
+        ...(style === 'piece' ? { from, to, calculated: Number(computed.toFixed(2)) } : {}),
+        createdAt: serverTimestamp(),
+      });
+      const newServices = dedupeKeepOrder(manualValid.map((m) => m.service.trim()));
+      if (newServices.length) b.set(doc(db, 'opsLists', storeId), { steps: arrayUnion(...newServices), updatedAt: serverTimestamp() }, { merge: true });
+      await b.commit();
       onClose();
       onSaved();
-      setFollowUp({ title: 'Payment recorded', message: `${money(amount)} paid to ${person.fullName} for ${label.trim()}.`, actions: [] });
+      setFollowUp({
+        title: 'Payment recorded',
+        message: `${money(amount)} paid to ${person.fullName} for ${label.trim()}${style === 'piece' && pairsTotal > 0 ? ` (${qtyFmt(pairsTotal)} pairs)` : ''}.`,
+        actions: [],
+      });
     } catch (err) {
       notify({ type: 'error', message: err?.message || 'Could not record payment.' });
     } finally {
@@ -3756,32 +4216,116 @@ const PayModal = ({ person, ctx, onClose, onSaved }) => {
   };
 
   return (
-    <ModalShell onClose={onClose}>
-      <ModalHeader icon={Wallet} title={`Pay ${person.fullName}`} subtitle={person.role} onClose={onClose} />
+    <ModalShell onClose={onClose} size={style === 'piece' ? 'wide' : 'md'}>
+      <ModalHeader icon={Wallet} title={`Pay ${person.fullName}`} subtitle={`${person.role || ''}${person.role ? ' · ' : ''}${PAY_STYLES.find((p) => p.id === style)?.label}`} onClose={onClose} />
       <form onSubmit={submit} className="space-y-4">
+        {style === 'piece' && (
+          <>
+            <div>
+              <SectionLabel hint="Finished runs in these dates">Work done</SectionLabel>
+              <div className="grid grid-cols-2 gap-3">
+                <Field id="py-from" label="From" type="date" value={from} onChange={(e) => setFrom(e.target.value)} compact />
+                <Field id="py-to" label="To" type="date" value={to} onChange={(e) => setTo(e.target.value)} compact />
+              </div>
+              {work.length === 0 ? (
+                <p className="mt-3 rounded-2xl border border-dashed border-[#CBDBF3] px-4 py-4 text-sm text-[#5C7196]">
+                  No finished production credited to {person.fullName} in these dates. Add them to a step in a run (Make shoes → open a run), or add your own line below.
+                </p>
+              ) : (
+                <div className="mt-3 space-y-2">
+                  {work.map((row) => {
+                    const paidAlready = isPaid(row);
+                    const on = rowOn(row);
+                    const pairs = num(rowPairs(row));
+                    return (
+                      <div key={row.key} className={`rounded-2xl border p-3 ${paidAlready ? 'border-[#EAF0F9] bg-[#F7FAFD] opacity-60' : on ? 'border-[#2B6CDA] bg-[#EAF2FE]/50' : 'border-[#E1E8F4] bg-white'}`}>
+                        <div className="flex items-start gap-3">
+                          <button type="button" disabled={paidAlready} onClick={() => setPick(row, { on: !on })} className={`mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full border-2 ${on ? 'border-[#2B6CDA] bg-[#2B6CDA] text-white' : 'border-[#CBDBF3] bg-white text-transparent'}`} aria-label={`Pay for ${row.service} on ${row.run.runNo}`}>
+                            <Check size={13} />
+                          </button>
+                          <div className="min-w-0 flex-1">
+                            <p className="truncate text-sm font-semibold" style={{ color: INK }}>{row.service} · {row.run.productName}</p>
+                            <p className="text-xs text-[#8CA0BC]">{row.run.runNo} · made {formatDate(row.run.completedDate)} · {row.run.madeTotal} pairs in the run</p>
+                          </div>
+                          {paidAlready ? <Badge tone="green">Already paid</Badge> : <p className="shrink-0 text-sm font-semibold" style={{ color: INK }}>{money(pairs * row.rate)}</p>}
+                        </div>
+                        {!paidAlready && on && (
+                          <div className="mt-2 flex items-center gap-2 pl-9 text-xs text-[#5C7196]">
+                            <input type="number" min="0" step="any" inputMode="decimal" value={rowPairs(row)} onChange={(e) => setPick(row, { pairs: e.target.value })} className="w-20 rounded-full border-2 border-[#E1E8F4] bg-white px-2.5 py-1 text-center text-sm font-semibold outline-none focus:border-[#2B6CDA]" style={{ color: INK }} />
+                            pairs × {money(row.rate)}
+                            {row.rate === 0 && <span className="font-semibold text-[#C0433A]">· set a rate for {row.service}</span>}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div>
+              <SectionLabel hint="Work that isn't in a production run">Add your own</SectionLabel>
+              {manual.length > 0 && (
+                <div className="mb-2.5 space-y-2.5">
+                  {manual.map((m) => (
+                    <div key={m.id} className="rounded-2xl border border-[#E1E8F4] bg-[#FBFCFE] p-3">
+                      <div className="flex items-start gap-2">
+                        <div className="min-w-0 flex-1">
+                          <SuggestInput id={`ms-${m.id}`} value={m.service} onChange={(v) => pickService(m.id, v)} options={serviceOptions} placeholder="Service (e.g. Stitching)" compact />
+                        </div>
+                        <button type="button" onClick={() => setManual((x) => x.filter((y) => y.id !== m.id))} className="mt-2 rounded-full p-1.5 text-[#8CA0BC] hover:bg-[#FBEAE8] hover:text-[#C0433A]" aria-label="Remove line"><X size={14} /></button>
+                      </div>
+                      <div className="mt-2 grid grid-cols-2 gap-3">
+                        <Field id={`mp-${m.id}`} label="Pairs" type="number" min="0" step="any" inputMode="decimal" value={m.pairs} onChange={(e) => setManualRow(m.id, { pairs: e.target.value })} compact />
+                        <Field id={`mr-${m.id}`} label="Rate / pair" type="number" min="0" step="any" inputMode="decimal" value={m.rate} onChange={(e) => setManualRow(m.id, { rate: e.target.value })} suffix="KSh" compact />
+                      </div>
+                      {num(m.pairs) > 0 && m.rate !== '' && <p className="mt-1.5 text-xs font-semibold text-[#5C7196]">= {money(num(m.pairs) * num(m.rate))}</p>}
+                    </div>
+                  ))}
+                </div>
+              )}
+              <button type="button" onClick={() => setManual((m) => [...m, { id: `m${Date.now()}${m.length}`, service: '', pairs: '', rate: '' }])} className="flex items-center gap-1.5 text-sm font-semibold text-[#2B6CDA]">
+                <Plus size={14} /> Add a service &amp; number of pairs
+              </button>
+              {incompleteManual && <p className="mt-1.5 text-xs font-medium text-[#C0433A]">Each of your own lines needs a service, pairs and a rate.</p>}
+            </div>
+
+            <div className="rounded-2xl bg-[#123A73] p-4 text-sm text-white">
+              <div className="flex justify-between text-[#D9E7FB]"><span>From production</span><span>{money(workTotal)}</span></div>
+              {manualTotal > 0 && <div className="mt-1 flex justify-between text-[#D9E7FB]"><span>Your own lines</span><span>{money(manualTotal)}</span></div>}
+              <div className="mt-2 flex justify-between border-t border-dashed border-white/20 pt-2 text-base font-semibold"><span>{qtyFmt(pairsTotal)} pairs</span><span>{money(computed)}</span></div>
+            </div>
+          </>
+        )}
+
         <Field id="py-label" label="Paying for" value={label} onChange={(e) => setLabel(e.target.value)} />
         <div>
-          <Field id="py-amt" label="Amount" type="number" min="0" step="any" inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} suffix="KSh" />
-          {style === 'piece' && suggestion > 0 && <p className="mt-1.5 text-xs text-[#5C7196]">Suggested from this month's production runs: {money(suggestion)}.</p>}
-          {style === 'piece' && suggestion === 0 && <p className="mt-1.5 text-xs text-[#8CA0BC]">Tag this person on steps in production runs to get a suggested amount.</p>}
+          <Field id="py-amt" label="Amount" type="number" min="0" step="any" inputMode="decimal" value={amount ?? ''} onChange={(e) => setAmountInput(e.target.value)} suffix="KSh" />
+          {style === 'piece' && Math.abs(num(amount) - computed) > 0.005 && (
+            <p className="mt-1.5 text-xs text-[#B9812E]">
+              Different from the worked-out {money(computed)}.{' '}
+              <button type="button" className="font-semibold underline" onClick={() => setAmountInput(null)}>Use {money(computed)}</button>
+            </p>
+          )}
         </div>
         <ChoiceRow value={method} onChange={setMethod} options={PAY_METHODS.map((m) => ({ id: m.id, label: m.label, icon: m.icon }))} />
         <Field id="py-date" label="Paid on" type="date" value={date} onChange={(e) => setDate(e.target.value)} />
         <Field id="py-note" label="Note (optional)" value={note} onChange={(e) => setNote(e.target.value)} />
-        <SubmitButton saving={saving} disabled={num(amount) <= 0}><Check size={15} /> Record payment</SubmitButton>
+        <SubmitButton saving={saving} disabled={!canSave}><Check size={15} /> Record payment</SubmitButton>
       </form>
     </ModalShell>
   );
 };
 
 const PayView = ({ ctx }) => {
-  const { staff, storeId, notify } = ctx;
+  const { staff, storeId, notify, lists } = ctx;
   const [payments, setPayments] = useState([]);
   const [loading, setLoading] = useState(true);
   const [openId, setOpenId] = useState(null);
   const [payFor, setPayFor] = useState(null);
   const [style, setStyle] = useState('monthly');
   const [rate, setRate] = useState('');
+  const [services, setServices] = useState([]); // [{ id, name, rate }]
   const [saving, setSaving] = useState(false);
 
   const load = useCallback(async () => {
@@ -3804,19 +4348,30 @@ const PayView = ({ ctx }) => {
     if (person) {
       setStyle(person.payStyle || 'monthly');
       setRate(person.payRate ? String(person.payRate) : '');
+      setServices((person.payServices || []).map((s, i) => ({ id: `s${i}`, name: s.name, rate: String(s.rate) })));
     }
   }, [openId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const serviceOptions = useMemo(() => dedupeSorted([...DEFAULT_STEPS, ...(lists.steps || [])]), [lists.steps]);
 
   const saveStyle = async () => {
     setSaving(true);
     try {
-      await updateDoc(doc(db, 'staff', person.id), { payStyle: style, payRate: num(rate), updatedAt: serverTimestamp() });
+      const payServices = services.filter((s) => s.name.trim() && s.rate !== '').map((s) => ({ name: s.name.trim(), rate: num(s.rate) }));
+      await updateDoc(doc(db, 'staff', person.id), { payStyle: style, payRate: num(rate), payServices: style === 'piece' ? payServices : [], updatedAt: serverTimestamp() });
       notify({ type: 'success', message: `${person.fullName}'s pay style saved.` });
     } catch (err) {
       notify({ type: 'error', message: err?.message || 'Could not save.' });
     } finally {
       setSaving(false);
     }
+  };
+
+  const paySummary = (s) => {
+    if (!s.payStyle) return 'Pay style not set';
+    const label = PAY_STYLES.find((p) => p.id === s.payStyle)?.label;
+    if (s.payStyle === 'piece' && (s.payServices || []).length) return `${label} · ${s.payServices.length} service rate${s.payServices.length !== 1 ? 's' : ''}`;
+    return `${label}${s.payRate ? ` ${money(s.payRate)}` : ''}`;
   };
 
   return (
@@ -3829,7 +4384,7 @@ const PayView = ({ ctx }) => {
           {[...staff].sort((a, b) => a.fullName.localeCompare(b.fullName)).map((s) => {
             const paid = payments.filter((p) => p.staffId === s.id && (p.date || '').startsWith(month)).reduce((t, p) => t + num(p.amount), 0);
             return (
-              <RowCard key={s.id} icon={User} title={s.fullName} subtitle={`${s.role} · ${s.payStyle ? `${PAY_STYLES.find((p) => p.id === s.payStyle)?.label}${s.payRate ? ` ${money(s.payRate)}` : ''}` : 'Pay style not set'}`} onClick={() => setOpenId(s.id)}
+              <RowCard key={s.id} icon={User} title={s.fullName} subtitle={`${s.role} · ${paySummary(s)}`} onClick={() => setOpenId(s.id)}
                 right={<p className="text-xs font-semibold text-[#5C7196]">{money(paid)}<span className="block font-normal text-[#8CA0BC]">this month</span></p>} />
             );
           })}
@@ -3842,9 +4397,35 @@ const PayView = ({ ctx }) => {
             <SectionLabel>How are they paid?</SectionLabel>
             <ChoiceRow value={style} onChange={setStyle} options={PAY_STYLES} />
             <div className="mt-3">
-              <Field id="pay-rate" label={style === 'piece' ? 'Rate per pair' : style === 'weekly' ? 'Weekly pay' : 'Monthly pay'} type="number" min="0" inputMode="decimal" value={rate} onChange={(e) => setRate(e.target.value)} suffix="KSh" />
+              <Field id="pay-rate" label={style === 'piece' ? 'Usual rate per pair' : style === 'weekly' ? 'Weekly pay' : 'Monthly pay'} type="number" min="0" inputMode="decimal" value={rate} onChange={(e) => setRate(e.target.value)} suffix="KSh" />
             </div>
-            <div className="mt-3 flex gap-2.5">
+
+            {style === 'piece' && (
+              <div className="mt-4">
+                <SectionLabel hint="Optional — if a service pays a different rate">Rate per service</SectionLabel>
+                {services.length > 0 && (
+                  <div className="mb-2.5 space-y-2">
+                    {services.map((s) => (
+                      <div key={s.id} className="flex items-start gap-2">
+                        <div className="min-w-0 flex-1">
+                          <SuggestInput id={`sv-${s.id}`} value={s.name} onChange={(v) => setServices((x) => x.map((y) => (y.id === s.id ? { ...y, name: v } : y)))} options={serviceOptions} placeholder="Service (e.g. Stitching)" compact />
+                        </div>
+                        <div className="w-32 shrink-0">
+                          <Field id={`sr-${s.id}`} compact type="number" min="0" step="any" inputMode="decimal" suffix="KSh" value={s.rate} onChange={(e) => setServices((x) => x.map((y) => (y.id === s.id ? { ...y, rate: e.target.value } : y)))} placeholder="Rate" />
+                        </div>
+                        <button type="button" onClick={() => setServices((x) => x.filter((y) => y.id !== s.id))} className="mt-2 shrink-0 rounded-full p-1.5 text-[#8CA0BC] hover:bg-[#FBEAE8] hover:text-[#C0433A]" aria-label="Remove service rate"><X size={14} /></button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <button type="button" onClick={() => setServices((x) => [...x, { id: `s${Date.now()}`, name: '', rate: '' }])} className="flex items-center gap-1.5 text-sm font-semibold text-[#2B6CDA]">
+                  <Plus size={14} /> Add a service rate
+                </button>
+                <p className="mt-2 text-xs text-[#8CA0BC]">When you pay, the steps they were credited on in finished runs are listed with these rates, so you can cross-check what they did.</p>
+              </div>
+            )}
+
+            <div className="mt-4 flex gap-2.5">
               <SoftButton icon={Check} onClick={saveStyle} disabled={saving}>Save pay style</SoftButton>
               <SoftButton icon={Banknote} onClick={() => setPayFor(person.id)}>Record payment</SoftButton>
             </div>
@@ -3853,9 +4434,21 @@ const PayView = ({ ctx }) => {
               {payments.filter((p) => p.staffId === person.id).length === 0 ? <p className="py-4 text-center text-sm text-[#8CA0BC]">Nothing recorded yet.</p> : (
                 <div className="space-y-2">
                   {payments.filter((p) => p.staffId === person.id).map((p) => (
-                    <div key={p.id} className="flex items-center justify-between rounded-xl border border-[#EAF0F9] bg-[#F7FAFD] px-3.5 py-2.5 text-sm">
-                      <span className="min-w-0"><span className="block truncate font-semibold" style={{ color: INK }}>{p.period}</span><span className="text-xs text-[#8CA0BC]">{formatDate(p.date)} · {PAY_METHODS.find((m) => m.id === p.method)?.label}</span></span>
-                      <span className="font-semibold" style={{ color: INK }}>{money(p.amount)}</span>
+                    <div key={p.id} className="rounded-xl border border-[#EAF0F9] bg-[#F7FAFD] px-3.5 py-2.5 text-sm">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="min-w-0"><span className="block truncate font-semibold" style={{ color: INK }}>{p.period}</span><span className="text-xs text-[#8CA0BC]">{formatDate(p.date)} · {methodLabel(p.method)}{num(p.pairsTotal) > 0 ? ` · ${qtyFmt(p.pairsTotal)} pairs` : ''}</span></span>
+                        <span className="font-semibold" style={{ color: INK }}>{money(p.amount)}</span>
+                      </div>
+                      {(p.items || []).length > 0 && (
+                        <div className="mt-1.5 space-y-0.5 border-t border-dashed border-[#DCE6F4] pt-1.5">
+                          {p.items.map((i, idx) => (
+                            <p key={idx} className="flex justify-between gap-2 text-xs text-[#5C7196]">
+                              <span className="truncate">{i.service}{i.runNo ? ` · ${i.runNo}` : ' · own entry'}{i.productName ? ` · ${i.productName}` : ''} · {qtyFmt(i.pairs)} × {money(i.rate)}</span>
+                              <span className="shrink-0 font-semibold">{money(i.amount)}</span>
+                            </p>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -3864,13 +4457,18 @@ const PayView = ({ ctx }) => {
           </ModalShell>
         )}
       </AnimatePresence>
-      <AnimatePresence>{payFor && person && <PayModal person={person} ctx={ctx} onClose={() => setPayFor(null)} onSaved={load} />}</AnimatePresence>
+      <AnimatePresence>{payFor && person && <PayModal person={person} payments={payments} ctx={ctx} onClose={() => setPayFor(null)} onSaved={load} />}</AnimatePresence>
     </div>
   );
 };
 
 /* ==================================================================== */
-/*  SUPPLIERS — add them up front, or they appear on first restock       */
+/*  SUPPLIERS — a full statement for each supplier                       */
+/*                                                                       */
+/*  Every purchase shows what it cost, what you owed on it, every        */
+/*  payment (amount, method, date), when it was paid off, and every      */
+/*  delivery (date, and why it was late). Later payments to a supplier   */
+/*  are applied to the OLDEST unpaid purchases first.                    */
 /* ==================================================================== */
 
 const AddSupplierModal = ({ ctx, onClose }) => {
@@ -3909,43 +4507,192 @@ const AddSupplierModal = ({ ctx, onClose }) => {
   );
 };
 
+// Unpaid purchases for one supplier, oldest first — what a new payment is applied to.
+const fetchUnpaidBuys = async (storeId, supplierId) =>
+  (await fetchWhere('opsRestocks', where('storeId', '==', storeId), where('supplierId', '==', supplierId)))
+    .filter((r) => r.status === 'active' && num(r.total) - num(r.paid) > 0.001)
+    .sort((a, b) => (a.date || '').localeCompare(b.date || '') || tms(a) - tms(b));
+
+const allocate = (buys, amount) => {
+  let left = amount;
+  const out = [];
+  buys.forEach((r) => {
+    if (left <= 0.001) return;
+    const owing = num(r.total) - num(r.paid);
+    const a = Math.min(owing, left);
+    left -= a;
+    out.push({ restock: r, amount: a, clears: a >= owing - 0.001 });
+  });
+  return { allocs: out, unallocated: Math.max(0, left) };
+};
+
 const PaySupplierModal = ({ supplier, ctx, onClose, onSaved }) => {
   const { storeId, notify, setFollowUp } = ctx;
   const [amount, setAmount] = useState(String(num(supplier.owed)));
   const [method, setMethod] = useState('cash');
   const [date, setDate] = useState(todayStr());
+  const [unpaid, setUnpaid] = useState(null);
   const [saving, setSaving] = useState(false);
   const amt = num(amount);
   const canSave = amt > 0 && amt <= num(supplier.owed) + 0.001;
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchUnpaidBuys(storeId, supplier.id)
+      .then((r) => !cancelled && setUnpaid(r))
+      .catch(() => !cancelled && setUnpaid([]));
+    return () => {
+      cancelled = true;
+    };
+  }, [storeId, supplier.id]);
+
+  const preview = unpaid ? allocate(unpaid, amt) : null;
+
   const submit = async (e) => {
     e.preventDefault();
     if (!canSave) return;
     setSaving(true);
     try {
+      // Fresh read so the payment is applied to what is really still unpaid.
+      const buys = await fetchUnpaidBuys(storeId, supplier.id);
+      const { allocs, unallocated } = allocate(buys, amt);
+      const stamp = Date.now();
       const b = writeBatch(db);
       b.update(doc(db, 'opsSuppliers', supplier.id), { owed: increment(-amt), updatedAt: serverTimestamp() });
-      b.set(doc(collection(db, 'opsSupplierPayments')), { storeId, supplierId: supplier.id, supplierName: supplier.name, amount: amt, method, date, createdAt: serverTimestamp() });
+      allocs.forEach(({ restock: r, amount: a, clears }) => {
+        b.update(doc(db, 'opsRestocks', r.id), {
+          paid: increment(a),
+          payments: arrayUnion({ amount: a, method, date, at: stamp }),
+          paymentStatus: clears ? 'paid' : 'part',
+          ...(clears ? { paidOffDate: date } : {}),
+        });
+      });
+      b.set(doc(collection(db, 'opsSupplierPayments')), {
+        storeId,
+        supplierId: supplier.id,
+        supplierName: supplier.name,
+        amount: amt,
+        method,
+        date,
+        kind: 'settlement',
+        allocations: allocs.map(({ restock: r, amount: a }) => ({ restockId: r.id, label: `${r.materialName} · ${formatDate(r.date)}`, amount: a })),
+        unallocated,
+        createdAt: serverTimestamp(),
+      });
       await b.commit();
       onClose();
       onSaved();
       const left = num(supplier.owed) - amt;
-      setFollowUp({ title: left <= 0.001 ? 'Fully paid off' : 'Payment recorded', message: left <= 0.001 ? `You no longer owe ${supplier.name} anything.` : `${money(amt)} paid. You still owe ${supplier.name} ${money(left)}.`, actions: [] });
+      const cleared = allocs.filter((x) => x.clears).length;
+      setFollowUp({
+        title: left <= 0.001 ? 'Fully paid off' : 'Payment recorded',
+        message: `${left <= 0.001 ? `You no longer owe ${supplier.name} anything.` : `${money(amt)} paid by ${methodLabel(method)}. You still owe ${supplier.name} ${money(left)}.`}${cleared ? ` ${cleared} purchase${cleared !== 1 ? 's were' : ' was'} cleared.` : ''}`,
+        actions: [],
+      });
     } catch (err) {
       notify({ type: 'error', message: err?.message || 'Could not record payment.' });
     } finally {
       setSaving(false);
     }
   };
+
   return (
     <ModalShell onClose={onClose}>
       <ModalHeader icon={Banknote} title={`Pay ${supplier.name}`} subtitle={`You owe ${money(supplier.owed)}`} onClose={onClose} />
       <form onSubmit={submit} className="space-y-4">
         <Field id="sp-amt" label="Amount paying" type="number" min="0" step="any" inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} suffix="KSh" />
-        <ChoiceRow value={method} onChange={setMethod} options={PAY_METHODS.map((m) => ({ id: m.id, label: m.label, icon: m.icon }))} />
+        <div>
+          <p className="mb-1.5 text-sm font-medium text-[#4C5E7A]">How are you paying?</p>
+          <ChoiceRow value={method} onChange={setMethod} options={PAY_METHODS.map((m) => ({ id: m.id, label: m.label, icon: m.icon }))} />
+        </div>
         <Field id="sp-date" label="Date" type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+        {preview && preview.allocs.length > 0 && (
+          <div className="rounded-2xl bg-[#F7FAFD] px-4 py-3">
+            <p className="mb-1.5 text-xs font-semibold text-[#5C7196]">Goes towards your oldest unpaid purchases first</p>
+            <div className="space-y-1">
+              {preview.allocs.map(({ restock: r, amount: a, clears }) => (
+                <p key={r.id} className="flex justify-between gap-2 text-xs text-[#5C7196]">
+                  <span className="truncate">{r.materialName} · {formatDate(r.date)}{clears ? ' · cleared' : ''}</span>
+                  <span className="shrink-0 font-semibold" style={{ color: INK }}>{money(a)}</span>
+                </p>
+              ))}
+            </div>
+          </div>
+        )}
         <SubmitButton saving={saving} disabled={!canSave}><Check size={15} /> Record payment</SubmitButton>
       </form>
     </ModalShell>
+  );
+};
+
+// One purchase on a supplier's statement.
+const PurchaseCard = ({ b }) => {
+  const rolled = b.status === 'rolled_back';
+  const total = num(b.total);
+  const paid = num(b.paid);
+  const owing = Math.max(0, total - paid);
+  const cleared = owing <= 0.001;
+  const pays = (b.payments?.length ? b.payments : paid > 0 ? [{ amount: paid, method: b.payMethod || '', date: b.date, legacy: true }] : [])
+    .slice()
+    .sort((x, y) => (x.date || '').localeCompare(y.date || '') || num(x.at) - num(y.at));
+  const dels = (b.deliveries?.length ? b.deliveries : num(b.received) > 0 ? [{ qty: b.received, date: b.date, reason: '' }] : [])
+    .slice()
+    .sort((x, y) => (x.date || '').localeCompare(y.date || '') || num(x.at) - num(y.at));
+  const paidOff = b.paidOffDate || (cleared && pays.length ? pays[pays.length - 1].date : null);
+  const daysToClear = paidOff && b.date ? Math.max(0, Math.round((new Date(paidOff) - new Date(b.date)) / 864e5)) : 0;
+  const stillComing = Math.max(0, num(b.quantity) - num(b.received));
+  const [tone, statusLabel] = rolled ? ['gray', 'Rolled back'] : cleared ? ['green', 'Paid in full'] : paid > 0 ? ['amber', 'Part-paid'] : ['red', 'On credit'];
+
+  return (
+    <div className={`rounded-2xl border border-[#EAF0F9] bg-[#F7FAFD] px-4 py-3 text-sm ${rolled ? 'opacity-60' : ''}`}>
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <p className="truncate font-semibold" style={{ color: INK }}>{b.materialName} · {qtyFmt(b.quantity)} {b.unit}</p>
+          <p className="text-xs text-[#8CA0BC]">Bought {formatDate(b.date)} · {money(b.unitCost)}/{b.unit}</p>
+        </div>
+        <div className="shrink-0 text-right">
+          <p className="font-semibold" style={{ color: INK }}>{money(total)}</p>
+          <Badge tone={tone}>{statusLabel}</Badge>
+        </div>
+      </div>
+
+      {!rolled && (
+        <p className={`mt-2 text-xs font-semibold ${cleared ? 'text-[#168A63]' : 'text-[#C0433A]'}`}>
+          {cleared
+            ? `Paid off ${paidOff ? formatDate(paidOff) : ''}${daysToClear > 0 ? ` · ${daysToClear} day${daysToClear !== 1 ? 's' : ''} after the purchase` : ' · on the day'}`
+            : `Owing ${money(owing)} since ${formatDate(b.date)} · ${daysSince(b.date)} day${daysSince(b.date) !== 1 ? 's' : ''}`}
+        </p>
+      )}
+
+      <div className="mt-2 space-y-1 border-t border-dashed border-[#DCE6F4] pt-2">
+        <p className="text-[11px] font-semibold uppercase tracking-wide text-[#8CA0BC]">Payments</p>
+        {pays.length === 0 ? (
+          <p className="text-xs text-[#8CA0BC]">Nothing paid yet.</p>
+        ) : (
+          pays.map((p, i) => (
+            <p key={i} className="flex justify-between gap-2 text-xs text-[#5C7196]">
+              <span>{formatDate(p.date)} · {methodLabel(p.method)}</span>
+              <span className="font-semibold" style={{ color: INK }}>{money(p.amount)}</span>
+            </p>
+          ))
+        )}
+      </div>
+
+      <div className="mt-2 space-y-1 border-t border-dashed border-[#DCE6F4] pt-2">
+        <p className="text-[11px] font-semibold uppercase tracking-wide text-[#8CA0BC]">Deliveries</p>
+        {dels.length === 0 ? (
+          <p className="text-xs text-[#8CA0BC]">Nothing has arrived yet.</p>
+        ) : (
+          dels.map((d, i) => (
+            <div key={i} className="text-xs text-[#5C7196]">
+              <p className="flex justify-between gap-2"><span>{formatDate(d.date)}</span><span className="font-semibold" style={{ color: INK }}>{qtyFmt(d.qty)} {b.unit}</span></p>
+              {d.reason && <p className="font-medium text-[#B9812E]">Late: {d.reason}</p>}
+            </div>
+          ))
+        )}
+        {!rolled && stillComing > 0 && <p className="text-xs font-semibold text-[#B9812E]">{qtyFmt(stillComing)} {b.unit} still to arrive · waiting {daysSince(b.date)} day{daysSince(b.date) !== 1 ? 's' : ''}</p>}
+      </div>
+    </div>
   );
 };
 
@@ -3965,7 +4712,7 @@ const SuppliersView = ({ ctx }) => {
         fetchWhere('opsRestocks', where('storeId', '==', storeId), where('supplierId', '==', openId)),
         fetchWhere('opsSupplierPayments', where('storeId', '==', storeId), where('supplierId', '==', openId)),
       ]);
-      setHist({ buys: buys.filter((b) => b.status === 'active').sort(byNewest), pays: pays.sort(byNewest), loading: false });
+      setHist({ buys: buys.sort((a, b) => (b.date || '').localeCompare(a.date || '') || byNewest(a, b)), pays: pays.sort((a, b) => (b.date || '').localeCompare(a.date || '') || byNewest(a, b)), loading: false });
     } catch {
       setHist({ buys: [], pays: [], loading: false });
       notify({ type: 'error', message: 'Could not load supplier history.' });
@@ -3976,6 +4723,11 @@ const SuppliersView = ({ ctx }) => {
   }, [load]);
 
   const owedTotal = suppliers.reduce((s, x) => s + Math.max(0, num(x.owed)), 0);
+  const activeBuys = hist.buys.filter((b) => b.status === 'active');
+  const totalBought = activeBuys.reduce((s, b) => s + num(b.total), 0);
+  const totalPaid = activeBuys.reduce((s, b) => s + num(b.paid), 0);
+  const rolledIds = new Set(hist.buys.filter((b) => b.status === 'rolled_back').map((b) => b.id));
+  const methodTotals = PAY_METHODS.map((m) => ({ ...m, total: hist.pays.filter((p) => p.method === m.id && !rolledIds.has(p.restockId)).reduce((s, p) => s + num(p.amount), 0) })).filter((m) => m.total > 0);
 
   return (
     <div>
@@ -3994,33 +4746,47 @@ const SuppliersView = ({ ctx }) => {
       <AnimatePresence>
         {supplier && (
           <ModalShell onClose={() => setOpenId(null)} size="wide">
-            <ModalHeader icon={Truck} title={supplier.name} subtitle={supplier.phone || 'Purchase and payment history'} onClose={() => setOpenId(null)} />
-            <div className="grid grid-cols-2 gap-3">
+            <ModalHeader icon={Truck} title={supplier.name} subtitle={supplier.phone || 'Statement of purchases, payments and deliveries'} onClose={() => setOpenId(null)} />
+            <div className="grid grid-cols-3 gap-3">
               <StatBox label="You owe" value={money(Math.max(0, num(supplier.owed)))} tone={num(supplier.owed) > 0.001 ? 'red' : 'green'} />
-              <StatBox label="Total bought" value={money(hist.buys.reduce((s, b) => s + num(b.total), 0))} />
+              <StatBox label="Total bought" value={money(totalBought)} />
+              <StatBox label="Total paid" value={money(totalPaid)} tone="green" />
             </div>
+            {methodTotals.length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-1.5">
+                {methodTotals.map((m) => (
+                  <span key={m.id} className="flex items-center gap-1.5 rounded-full bg-[#EAF2FE] px-3 py-1.5 text-xs font-semibold text-[#2B6CDA]">
+                    <m.icon size={12} /> {m.label} {money(m.total)}
+                  </span>
+                ))}
+              </div>
+            )}
             {num(supplier.owed) > 0.001 && <div className="mt-4"><SubmitButton type="button" onClick={() => setPayId(supplier.id)}><Banknote size={15} /> Pay this supplier</SubmitButton></div>}
+
             <div className="mt-5">
-              <SectionLabel>Purchases</SectionLabel>
+              <SectionLabel hint="Newest first">Purchases</SectionLabel>
               {hist.loading ? <Spinner /> : hist.buys.length === 0 ? <p className="py-3 text-center text-sm text-[#8CA0BC]">No purchases recorded.</p> : (
-                <div className="space-y-2">
-                  {hist.buys.map((b) => (
-                    <div key={b.id} className="rounded-xl border border-[#EAF0F9] bg-[#F7FAFD] px-3.5 py-2.5 text-sm">
-                      <div className="flex justify-between gap-2"><span className="font-semibold" style={{ color: INK }}>{b.materialName} · {qtyFmt(b.quantity)} {b.unit}</span><span className="font-semibold" style={{ color: INK }}>{money(b.total)}</span></div>
-                      <p className="text-xs text-[#8CA0BC]">{formatDate(b.date)} · {b.paymentStatus === 'paid' ? 'Paid in full' : b.paymentStatus === 'part' ? 'Part-paid' : 'On credit'}{b.deliveryStatus === 'part' ? ' · part delivered' : ''}</p>
-                    </div>
-                  ))}
+                <div className="space-y-2.5">
+                  {hist.buys.map((b) => <PurchaseCard key={b.id} b={b} />)}
                 </div>
               )}
             </div>
+
             {hist.pays.length > 0 && (
               <div className="mt-5">
-                <SectionLabel>Payments you made</SectionLabel>
+                <SectionLabel hint="Every payment, newest first">All payments you made</SectionLabel>
                 <div className="space-y-2">
                   {hist.pays.map((p) => (
-                    <div key={p.id} className="flex items-center justify-between rounded-xl border border-[#EAF0F9] bg-[#F7FAFD] px-3.5 py-2 text-sm">
-                      <span className="text-[#5C7196]">{formatDate(p.date)} · {PAY_METHODS.find((m) => m.id === p.method)?.label}</span>
-                      <span className="font-semibold" style={{ color: INK }}>{money(p.amount)}</span>
+                    <div key={p.id} className={`rounded-xl border border-[#EAF0F9] bg-[#F7FAFD] px-3.5 py-2.5 text-sm ${rolledIds.has(p.restockId) ? 'opacity-60' : ''}`}>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[#5C7196]">{formatDate(p.date)} · {methodLabel(p.method)}</span>
+                        <span className="font-semibold" style={{ color: INK }}>{money(p.amount)}</span>
+                      </div>
+                      <p className="text-xs text-[#8CA0BC]">
+                        {p.kind === 'purchase' ? 'Paid when the stock was bought' : 'Paid off earlier purchases'}
+                        {(p.allocations || []).length > 0 ? ` — ${p.allocations.map((a) => a.label).join(', ')}` : ''}
+                        {rolledIds.has(p.restockId) ? ' · purchase rolled back' : ''}
+                      </p>
                     </div>
                   ))}
                 </div>
@@ -4128,8 +4894,10 @@ export default function Operations({ onNotify, currentUser }) {
   const allOrders = useAllDocs('opsOrders');
   const place = usePlaceStock(storeId, !isFactory);
 
-  // The factory sees orders from every place; other places only their own.
-  const orders = useMemo(() => (isFactory ? allOrders.rows : allOrders.rows.filter((o) => o.storeId === storeId)), [allOrders.rows, isFactory, storeId]);
+  // Every place (factory, warehouse, retail) sees every order, so orders can be
+  // tracked across the whole business. `o.storeId` is still the place that took
+  // the order, and the Orders list shows that place's name on orders from elsewhere.
+  const orders = allOrders.rows;
 
   useEffect(() => onSnapshot(collection(db, 'stores'), (s) => setStores(s.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => a.name.localeCompare(b.name))), () => setStores([])), []);
   useEffect(() => onSnapshot(doc(db, 'opsSettings', 'main'), (s) => setSettings({ loaded: true, warehouseStoreId: null, warehouseSet: false, roles: {}, ...(s.exists() ? s.data() : {}) }), () => setSettings((x) => ({ ...x, loaded: true }))), []);
@@ -4175,6 +4943,7 @@ export default function Operations({ onNotify, currentUser }) {
     },
     [isFactory, store, firstFactory, jump, notify]
   );
+  // mode: 'pay' opens the payment dialog, 'deliver' opens the delivery dialog.
   const goOrder = useCallback((orderId, mode) => {
     setIntent({ type: 'order', orderId, mode });
     setSection('orders');
@@ -4243,6 +5012,7 @@ export default function Operations({ onNotify, currentUser }) {
   const activeRuns = runs.rows.filter((r) => r.status === 'in_progress');
   const unplaced = runs.rows.filter((r) => r.status === 'completed' && !r.placedStoreId);
   const owedSuppliers = suppliers.rows.reduce((s, x) => s + Math.max(0, num(x.owed)), 0);
+  const readyToDeliver = openOrders.filter((o) => o.workStatus === 'ready');
 
   const tileInfo = {
     materials: { line: lowMaterials.length ? `${lowMaterials.length} low on stock` : `${materials.rows.length} materials`, alert: lowMaterials.length > 0 },
@@ -4256,10 +5026,11 @@ export default function Operations({ onNotify, currentUser }) {
 
   const attention = [
     ...overdue.slice(0, 3).map((o) => ({ key: `o${o.id}`, text: `${o.orderNo} for ${o.clientName} is overdue`, tone: 'red', go: () => goOrder(o.id) })),
+    ...readyToDeliver.filter((o) => !overdue.some((x) => x.id === o.id)).slice(0, 2).map((o) => ({ key: `d${o.id}`, text: `${o.orderNo} for ${o.clientName} is ready — mark it delivered when handed over`, tone: 'amber', go: () => goOrder(o.id, 'deliver') })),
     ...(isFactory ? unplaced.slice(0, 2).map((r) => ({ key: `u${r.id}`, text: `${r.madeTotal} pairs from ${r.runNo} aren't in a store yet`, tone: 'amber', go: () => goPlace(r.id) })) : []),
     ...(isFactory ? lowMaterials.slice(0, 3).map((m) => ({ key: `m${m.id}`, text: `${m.name} is ${num(m.quantity) <= 0 ? 'finished' : 'running low'}`, tone: 'amber', go: () => setSection('materials') })) : []),
     ...(!isFactory ? lowStock.slice(0, 3).map((r) => ({ key: `s${r.item.id}`, text: `${r.item.name} is ${stockState(r).out ? 'out of stock' : 'running low'}`, tone: 'amber', go: () => setSection('stock') })) : []),
-  ].slice(0, 5);
+  ].slice(0, 6);
 
   if (stores.length === 0) {
     return (
@@ -4305,7 +5076,7 @@ export default function Operations({ onNotify, currentUser }) {
                     ? warehouseName
                       ? `Set up top to bottom. Finished shoes go to ${warehouseName}.`
                       : 'Set up top to bottom. Choose a warehouse with the gear above.'
-                    : `${ROLE_LABEL[role]} · see what is on the shelf and take orders from it.`}
+                    : `${ROLE_LABEL[role]} · see what is on the shelf, take orders from it and follow every order across the business.`}
                 </p>
               </div>
 
